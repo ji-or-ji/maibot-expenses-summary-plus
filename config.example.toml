@@ -1,0 +1,71 @@
+[plugin]
+config_version = "1.0.2"
+
+[report]
+mode = "maichenfeng"
+title = "今日模型调用财报"
+llm_task = "utils"
+use_forward_message = true
+default_opening = "{date}模型调用财报已生成，以下是今日请求次数、回复量与模型成本汇总。感谢大家的投喂，欢迎继续支持～"
+
+[permission]
+query_admin_only = false
+admins = ["***REDACTED***"]
+
+[scheduler]
+enabled = true
+time = "23:30"
+group_ids = []
+private_ids = []
+
+[fallback]
+xiao_names = ["孙笑川"]
+locations = [
+    "家里",
+    "直播间",
+    "工作室",
+    "走廊",
+]
+poems = [
+    "今天也是嘴硬的一天。",
+    "气冷抖，孙狗什么时候才能站起来？",
+    "我永远喜欢孙笑川！",
+    "大家都很聪明，就是有点笨。",
+]
+thanks_list = [
+    "孙笑川：114514",
+    "抽象带篮：1919810",
+    "吃花椒的喵酱：810",
+]
+opening_template = '''我是{xiao_name}，在{location}向大家汇报今天的运营情况。
+{date_text}：模型调用 {total_requests} 次，回复 {total_replies} 条，成本合计 {total_cost} 元。
+详细数据见下图。
+
+{date_text}{went_to}'''
+thanks_template = '''以上就是今天的财报。
+
+模型账单日积月累，钱包确实有点吃紧，全靠群友们的投喂续命，一块两块不嫌少，都是撑下去的动力～
+
+{ledger_line}{poem}
+特别感谢 {thanks_amounts}{thanks_suffix} 的投喂🙏
+谢谢大家！'''
+
+[ledger]
+enabled = true # 账本功能总开关；关闭后 /记账 /账本 均不可用，财报也不再播报累计账本
+admin_only = true # 记账命令是否仅管理员可用；查询（/账本）不受此限制
+
+[billing]
+# 计费模式：usage=纯按量(原口径) | subscription=固定月费 | hybrid=订阅模型+其余按量混合
+mode = "hybrid"
+# 订阅支付币种：usd=美元计费（按续费日汇率折人民币）| cny=人民币计费（不换算汇率）
+currency = "usd"
+# 每月续费日（扣款日，1-31；大于当月天数时取月末）
+renew_day = 14
+# 每期续费金额（续费日到下个续费日扣款额，配合 currency 使用）
+renew_amount = 10.0
+# true=把本期订阅费按周期天数均摊为日均成本；false=整期费用一次展示
+share_daily = true
+# hybrid 模式生效：模型名包含任一关键词即视为订阅（子串匹配，OpenCodeGo 的模型带 -go 后缀）
+subscription_models = ["-go"]
+# usd 计费且自动获取汇率失败时使用的兜底 USD→CNY 汇率
+exchange_rate = 7.2
