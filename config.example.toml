@@ -15,24 +15,7 @@ admins = ["***REDACTED***"]
 [scheduler]
 enabled = true
 time = "23:30"
-group_ids = []
-private_ids = []
 
-[fallback]
-xiao_names = ["孙笑川"]
-locations = 
-    "家里",
-    "直播间",
-    "工作室",
-    "走廊",
-]
-poems = [
-    "今天也是嘴硬的一天。",
-    "气冷抖，孙狗什么时候才能站起来？",
-    "我永远喜欢孙笑川！",
-    "大家都很聪明，就是有点笨。",
-]
-thanks_list = [
     "孙笑川：114514",
     "抽象带篮：1919810",
     "吃花椒的喵酱：810",
