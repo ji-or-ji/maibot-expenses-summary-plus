@@ -223,5 +223,7 @@ exchange_rate = 7.2
 
 [Kmaj1st/expenses_summary](https://github.com/Kmaj1st/expenses_summary) - 一个 MaiBot 插件，让你的麦麦化身“户晨风本风”，每天用咬牙切齿的语气公开处刑自己（并顺带感谢股东），麦晨风模式取自此插件。
 
+[davidblackcn/maibot-expenses-summary-plugin](https://github.com/DavidBlackCN/maibot-expenses-summary-plugin)（麦麦财务总结插件） - 本插件基于此插件修改。
+
 ## 许可证
 MIT
