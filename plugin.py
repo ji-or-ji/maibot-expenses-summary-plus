@@ -11,6 +11,7 @@ import html
 import json
 import random
 import re
+import shutil
 import urllib.request
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -194,6 +195,15 @@ class ExpensesSummaryPlugin(MaiBotPlugin):
         self._fallback_config = ExpensesSummaryConfig()
 
     async def on_load(self) -> None:
+        try:
+            paths = _get_path(self.ctx, "paths")
+            data_dir = getattr(paths, "data_dir", None)
+            if data_dir:
+                _set_data_dir(data_dir)
+                _log(self.ctx, "info", f"数据目录已切换: {data_dir}")
+            _migrate_legacy_data()
+        except Exception:
+            pass
         config = self._get_config()
         if config.scheduler.enabled:
             self._scheduler_task = asyncio.create_task(self._scheduler_loop())
@@ -544,9 +554,41 @@ def _subscription_period(today: date, renew_day: int) -> tuple[date, date]:
 _RATE_CACHE_FILENAME = "exchange_rate.json"
 _RATE_API_TIMEOUT = 6
 
+# 运行时数据目录：优先使用 MaiBot SDK 的 ctx.paths.data_dir（on_load 时注入），
+# 未注入时回退到插件目录下的 data/，避免升级/重装时数据丢失。
+_DATA_DIR: Optional[Path] = None
+
+
+def _set_data_dir(path: Any) -> None:
+    """设置运行时数据目录（由 on_load 从 ctx.paths.data_dir 注入）。"""
+    global _DATA_DIR
+    if path:
+        _DATA_DIR = Path(str(path))
+
+
+def _data_dir() -> Path:
+    """返回当前数据目录。"""
+    return _DATA_DIR or (Path(__file__).resolve().parent / "data")
+
+
+def _migrate_legacy_data() -> None:
+    """把旧版插件目录下 data/ 的运行时数据迁移到新的数据目录（仅首次，避免历史账本丢失）。"""
+    data_dir = _data_dir()
+    legacy_dir = Path(__file__).resolve().parent / "data"
+    if legacy_dir == data_dir:
+        return
+    for name in (LEDGER_FILENAME, _RATE_CACHE_FILENAME):
+        legacy = legacy_dir / name
+        if legacy.exists() and not (data_dir / name).exists():
+            try:
+                data_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(legacy, data_dir / name)
+            except Exception:
+                pass
+
 
 def _rate_cache_path() -> Path:
-    path = Path(__file__).resolve().parent / "data" / _RATE_CACHE_FILENAME
+    path = _data_dir() / _RATE_CACHE_FILENAME
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -1350,7 +1392,7 @@ LEDGER_FILENAME = "ledger.json"
 
 
 def _ledger_path() -> Path:
-    path = Path(__file__).resolve().parent / "data" / LEDGER_FILENAME
+    path = _data_dir() / LEDGER_FILENAME
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
 

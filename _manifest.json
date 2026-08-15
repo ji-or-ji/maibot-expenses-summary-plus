@@ -34,7 +34,6 @@
     "chat.open_session",
     "render.html2png",
     "llm.generate",
-    "statistics.local.models",
     "statistics.local.model_trend",
     "statistics.local.message_trend"
   ],
