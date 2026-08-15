@@ -20,7 +20,7 @@ private_ids = []
 
 [fallback]
 xiao_names = ["孙笑川"]
-locations = [
+locations = 
     "家里",
     "直播间",
     "工作室",
