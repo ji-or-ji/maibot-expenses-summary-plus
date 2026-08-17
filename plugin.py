@@ -424,6 +424,57 @@ class ExpensesSummaryPlugin(MaiBotPlugin):
         await _send_command_response(self.ctx, response, target_stream_id)
         return True, response, True
 
+    @Command(
+        name="ledger_history",
+        description="查看历史所有投喂记录",
+        pattern=r"^/(?:投喂史|历史投喂|投喂记录|donations)$",
+    )
+    async def ledger_history_command(
+        self,
+        ctx: Any = None,
+        message: Any = None,
+        stream_id: Optional[str] = None,
+        chat_stream: Any = None,
+        *_args: Any,
+        **kwargs: Any,
+    ) -> tuple[bool, str, bool]:
+        target_stream_id = _first_present(
+            stream_id,
+            _get_stream_id(ctx),
+            _get_stream_id(message),
+            _get_stream_id(chat_stream),
+            _get_stream_id(kwargs),
+        )
+        config = self._get_config()
+        if not config.ledger.enabled:
+            response = "账本功能未启用"
+            await _send_command_response(self.ctx, response, target_stream_id)
+            return True, response, True
+        ledger = _load_ledger()
+        rows: list[tuple[str, str, str, float]] = []
+        for day_key, day in ledger.get("records", {}).items():
+            for item in day.get("donations", []):
+                note = str(item.get("note") or "").strip() or "匿名"
+                at = str(item.get("at") or "").strip()
+                try:
+                    amt = float(item.get("amount", 0) or 0)
+                except (TypeError, ValueError):
+                    amt = 0.0
+                rows.append((day_key, at, note, amt))
+        rows.sort(key=lambda r: (r[0], r[1]))
+        if not rows:
+            response = "暂无投喂记录"
+            await _send_command_response(self.ctx, response, target_stream_id)
+            return True, response, True
+        total = sum(r[3] for r in rows)
+        lines = [f"📋 历史投喂记录（{len(rows)} 条，合计 {total:.2f} 元）："]
+        for day_key, at, note, amt in rows:
+            suffix = f" {at}" if at else ""
+            lines.append(f"{day_key}{suffix} {note} +{amt:.2f}")
+        response = "\n".join(lines)
+        await _send_command_response(self.ctx, response, target_stream_id)
+        return True, response, True
+
     async def _send_report(self, ctx: Any, stream_id: Optional[str] = None) -> bool:
         config = self._get_config()
         mode = _normalize_mode(config.report.mode)
