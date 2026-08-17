@@ -1,11 +1,12 @@
 [plugin]
-config_version = "1.0.3"
+config_version = "1.0.4"
 
 [report]
 mode = "maichenfeng"
 title = "今日模型调用财报"
 llm_task = "utils"
 use_forward_message = true
+nickname = "麦麦" # 转发消息内的昵称；留空自动取机器人昵称(还有点小问题...等我下个版本修)
 default_opening = "{date}模型调用财报已生成，以下是今日请求次数、回复量与模型成本汇总。感谢大家的投喂，欢迎继续支持～"
 
 [permission]

@@ -82,6 +82,7 @@ class ReportConfig(PluginConfigBase):
     title: str = Field(default="今日模型调用财报", title="默认模式标题")
     llm_task: str = Field(default="utils", title="财报文案模型任务名")
     use_forward_message: bool = Field(default=True, title="使用转发消息发送")
+    nickname: str = Field(default="", title="转发昵称", description="转发消息内的昵称；留空自动取机器人昵称，取不到用麦麦")
     default_opening: str = Field(
         default="{date}模型调用财报已生成，以下是今日请求次数、回复量与模型成本汇总。",
         title="默认模式开头文本",
@@ -395,6 +396,12 @@ class ExpensesSummaryPlugin(MaiBotPlugin):
             response = "账本功能未启用"
             await _send_command_response(self.ctx, response, target_stream_id)
             return True, response, True
+        # 实时刷新今日开销（statistics API），避免账本停留在上次财报快照
+        try:
+            live_data = await _collect_report_data(ctx)
+            _record_today_cost(live_data.total_cost)
+        except Exception:
+            pass
         donation, cost, net = _ledger_summary()
         ledger = _load_ledger()
         today = datetime.now().strftime("%Y-%m-%d")
@@ -425,7 +432,7 @@ class ExpensesSummaryPlugin(MaiBotPlugin):
         _record_today_cost(data.total_cost)
         image = await _render_report_image(ctx, data, mode, config.report.title, ledger_enabled=config.ledger.enabled)
         fun = await _generate_fun_elements(ctx, config) if mode == REPORT_MODE_MAICHENFENG else None
-        nickname = await _resolve_bot_nickname(ctx) or "麦麦"
+        nickname = (config.report.nickname or "").strip() or (await _resolve_bot_nickname(ctx)) or "麦麦"
         nodes = _build_forward_nodes(data, image, mode, config, fun, nickname=nickname)
         if config.report.use_forward_message:
             sent = await _send_forward(ctx, nodes, stream_id)
@@ -485,6 +492,13 @@ async def _resolve_bot_nickname(ctx: Any) -> str:
                 return str(value).strip()
     except Exception:
         pass
+    for path in ("config.bot.nickname", "config.bot.name", "bot.nickname", "bot.name", "self.nickname", "self.name", "sender.name"):
+        try:
+            value = _get_path(ctx, path)
+            if value:
+                return str(value).strip()
+        except Exception:
+            pass
     return ""
 
 

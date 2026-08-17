@@ -2,7 +2,7 @@
   "manifest_version": 2,
   "id": "fulawa.maibot-expenses-summary-plus",
   "name": "麦麦财务总结优化",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "统计当天模型调用次数和花费，支持按量/订阅/混合三种计费口径（续费日周期、自动汇率），以默认或麦晨风模式生成转发消息财报。",
   "author": {
     "name": "fulawa",
