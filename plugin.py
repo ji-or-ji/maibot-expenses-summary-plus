@@ -1,8 +1,9 @@
 """
-MaiBot expenses summary plugin (v2.0.0).
+MaiBot expenses summary plugin.
 
-v2.0 起不再依赖麦麦内置价格表：改为定时抓取供应商官网牌价，
-按缓存命中/未命中/输出三分与峰谷时段自行计价，并支持账本人工修正量。
+统计当天模型调用次数与成本，生成财报文本与图片。
+成本由官方牌价引擎计算（定时抓取供应商官网牌价，按缓存三分与峰谷时段计价），
+支持订阅 / 混合计费口径与账本人工修正量。
 """
 
 from __future__ import annotations
@@ -99,6 +100,16 @@ class ReportConfig(PluginConfigBase):
         default="{date}模型调用财报已生成，以下是今日请求次数、回复量与模型成本汇总。",
         title="默认模式开头文本",
         description="可使用 {date} 占位符表示当天日期",
+    )
+    show_commands: bool = Field(
+        default=True,
+        title="财报附带指令说明",
+        description="在财报末尾附上可用指令清单，方便新人上手与自查",
+    )
+    commands_hint: str = Field(
+        default="",
+        title="指令说明文本",
+        description="自定义指令清单；留空使用内置默认",
     )
 
 
@@ -1490,8 +1501,9 @@ async def _render_report_image(ctx: Any, data: ReportData, mode: str, title: str
             return await _maybe_await(
                 html2png(
                     html_doc,
-                    selector=".sheet",
-                    viewport={"width": 900, "height": 1200},
+                    # full_page 仅在 selector==body 时生效，靠它才能按内容全高截图
+                    selector="body",
+                    viewport={"width": 900, "height": 480},
                     device_scale_factor=1.0,
                     full_page=True,
                 )
@@ -1545,15 +1557,12 @@ def _build_report_html(data: ReportData, mode: str, title: str, ledger_enabled: 
 body {{
   margin: 0;
   width: 900px;
-  min-height: 1200px;
   font-family: "Microsoft YaHei", "PingFang SC", Arial, sans-serif;
   color: #202124;
-  background: #f4f7f8;
+  background: linear-gradient(180deg, #ffffff 0%, #eef4f5 100%);
 }}
 .sheet {{
-  min-height: 1200px;
   padding: 54px;
-  background: linear-gradient(180deg, #ffffff 0%, #eef4f5 100%);
 }}
 .head {{
   border-left: 10px solid #0f766e;
@@ -1745,11 +1754,36 @@ def _build_forward_nodes(
 ) -> list[dict[str, Any]]:
     opening = _build_opening(data, mode, config, fun)
     thanks = _build_thanks(data, config, fun)
-    return [
+    nodes = [
         _make_forward_node("text", opening, nickname=nickname),
         _image_node(image, nickname=nickname),
         _make_forward_node("text", thanks, nickname=nickname),
     ]
+    hint = _build_commands_hint(config)
+    if hint:
+        nodes.append(_make_forward_node("text", hint, nickname=nickname))
+    return nodes
+
+
+DEFAULT_COMMANDS_HINT = (
+    "📖 可用指令（标「管理」的仅管理员可用）\n"
+    "/今日财报　重新生成财报\n"
+    "/账本　累计账本与今日明细\n"
+    "/投喂史　历史投喂记录\n"
+    "/记账 <金额> [备注]　记一笔投喂（管理）\n"
+    "/财报模式 默认|麦晨风　切换财报风格（管理）\n"
+    "/价格　查看官方牌价表（管理）\n"
+    "更多（均管理）：/价格刷新　/价格确认　/价格否决　/消耗修正　/捐赠修正"
+)
+
+
+def _build_commands_hint(config: ExpensesSummaryConfig) -> str:
+    """财报末尾的指令清单。可用 report.show_commands / report.commands_hint 控制。"""
+    report = getattr(config, "report", None)
+    if not bool(getattr(report, "show_commands", True)):
+        return ""
+    custom = str(getattr(report, "commands_hint", "") or "").strip()
+    return custom or DEFAULT_COMMANDS_HINT
 
 
 def _build_opening(
@@ -2619,9 +2653,9 @@ body {
   width: 900px;
   font-family: "Microsoft YaHei", "PingFang SC", Arial, sans-serif;
   color: #202124;
-  background: #f4f7f8;
+  background: linear-gradient(180deg, #ffffff 0%, #eef4f5 100%);
 }
-.sheet { padding: 54px; background: linear-gradient(180deg, #ffffff 0%, #eef4f5 100%); }
+.sheet { padding: 54px; }
 .head { border-left: 10px solid #0f766e; padding-left: 24px; margin-bottom: 30px; }
 .kicker { font-size: 26px; color: #52605f; margin-bottom: 8px; }
 h1 { margin: 0; font-size: 50px; line-height: 1.14; }
@@ -2817,8 +2851,9 @@ async def _render_price_card(ctx: Any, prices: dict[str, Any], config: Any = Non
         return await _maybe_await(
             html2png(
                 html_doc,
-                selector=".sheet",
-                viewport={"width": 900, "height": 1200},
+                # 同报告卡片：selector 必须为 body，full_page 才会生效
+                selector="body",
+                viewport={"width": 900, "height": 480},
                 device_scale_factor=1.0,
                 full_page=True,
             )

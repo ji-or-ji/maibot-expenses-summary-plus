@@ -119,6 +119,25 @@ check("无参数时 token 为空", token == "", repr(token))
 # 解析用例只做纯解析、没有落库，所以修正量应仍是前面设过的 12.5
 check("无参数不改动修正量", float(plugin._ledger_manual().get("cost_adjustment") or 0) == 12.5)
 
+# --- 财报附带的指令提示 ---
+print("\n[10] 财报附带指令提示")
+cfg = plugin.ExpensesSummaryConfig()
+data = plugin.ReportData(
+    date_text="测试日", total_requests=3, total_replies=2, total_cost=1.5, model_costs=[]
+)
+cfg.report.show_commands = True
+nodes_on = plugin._build_forward_nodes(data, "IMG", "default", cfg)
+cfg.report.show_commands = False
+nodes_off = plugin._build_forward_nodes(data, "IMG", "default", cfg)
+check("默认开启：转发节点 = 4", len(nodes_on) == 4, str(len(nodes_on)))
+check("关闭后：转发节点 = 3", len(nodes_off) == 3, str(len(nodes_off)))
+hint_text = nodes_on[-1]["segments"][0]["content"]
+check("末节点内含 /今日财报", "/今日财报" in hint_text)
+cfg.report.show_commands = True
+cfg.report.commands_hint = "只用这一行"
+check("自定义文本优先", plugin._build_commands_hint(cfg) == "只用这一行")
+check("内置默认非空", bool(plugin._build_commands_hint(plugin.ExpensesSummaryConfig())))
+
 plugin._set_data_dir(None)
 shutil.rmtree(tmp, ignore_errors=True)
 
