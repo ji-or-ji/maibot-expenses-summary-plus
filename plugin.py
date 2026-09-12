@@ -1,5 +1,8 @@
 """
-MaiBot 1.0.2 / sdk2.x expenses summary plugin.
+MaiBot expenses summary plugin (v2.0.0).
+
+v2.0 起不再依赖麦麦内置价格表：改为定时抓取供应商官网牌价，
+按缓存命中/未命中/输出三分与峰谷时段自行计价，并支持账本人工修正量。
 """
 
 from __future__ import annotations
@@ -12,7 +15,13 @@ import json
 import random
 import re
 import shutil
+import sqlite3
 import urllib.request
+
+try:
+    from zoneinfo import ZoneInfo
+except Exception:  # pragma: no cover - Python < 3.9
+    ZoneInfo = None  # type: ignore[assignment]
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -63,6 +72,9 @@ class ReportData:
     total_cost: float
     model_costs: list[ModelCost]
     cost_note: str = ""
+    # 成本是否来自牌价引擎。为 True 时订阅模型的按量部分已被正确排除，
+    # 计费层不能再拿 model_costs 求和（统计接口的模型名区分不出供应商）
+    usage_from_prices: bool = False
 
 
 @dataclass
@@ -163,6 +175,53 @@ class BillingConfig(PluginConfigBase):
     )
 
 
+class PricingConfig(PluginConfigBase):
+    """官方牌价抓取与计费口径配置。"""
+
+    enabled: bool = Field(
+        default=True,
+        title="启用官方牌价计费",
+        description="开启后按抓取到的官方价格计算成本，关闭则退回麦麦原生 cost 口径",
+    )
+    auto_refresh: bool = Field(default=True, title="定时抓取", description="每天在 refresh_time 自动抓取一次官方价格页")
+    refresh_time: str = Field(default="04:10", title="抓取时间", description="每天执行抓取的时刻，格式 HH:MM")
+    llm_task: str = Field(
+        default="utils",
+        title="解析模型任务名",
+        description="用于把价格页文本解析成结构化价格的 LLM 任务名，留空用 report.llm_task",
+    )
+    change_threshold_percent: float = Field(
+        default=20.0,
+        title="巨变阈值（%）",
+        description="任一单价相对现役值的变化幅度超过该百分比，或出现新增/消失的价带时，改为挂起等待管理员确认",
+    )
+    require_admin_confirm: bool = Field(
+        default=True,
+        title="巨变需管理员确认",
+        description="关闭后即使变化超过阈值也直接自动应用",
+    )
+    fallback_to_native_cost: bool = Field(
+        default=True,
+        title="兜底使用麦麦原生 cost",
+        description="某模型没有牌价或查询失败时，退回该模型在麦麦里的原生 cost，避免财报开天窗",
+    )
+    rebuild_ledger: bool = Field(
+        default=True,
+        title="用真实价重建账本",
+        description="启用后首次生效价格时，用官方牌价重算账本里的历史累计开销（只改 cost，不动投喂记录）",
+    )
+    rebuild_from: str = Field(
+        default="",
+        title="重建起始日期",
+        description="账本重建的起始日（YYYY-MM-DD），留空自动取账本最早一天",
+    )
+    sources: list[str] = Field(
+        default=[],
+        title="价格源覆盖",
+        description="格式 供应商=页面地址，可覆盖内置默认源；留空用内置",
+    )
+
+
 # BGM support is temporarily disabled since 1.0.1 because the current sdk2.x
 # public send capability does not expose send.audio.
 # class AudioConfig(PluginConfigBase):
@@ -171,7 +230,7 @@ class BillingConfig(PluginConfigBase):
 
 
 class PluginMetaConfig(PluginConfigBase):
-    config_version: str = Field(default="1.0.2", title="配置文件版本")
+    config_version: str = Field(default="2.0.0", title="配置文件版本")
 
 
 class ExpensesSummaryConfig(PluginConfigBase):
@@ -182,6 +241,7 @@ class ExpensesSummaryConfig(PluginConfigBase):
     fallback: FallbackConfig = Field(default_factory=FallbackConfig, title="麦晨风素材")
     ledger: LedgerConfig = Field(default_factory=LedgerConfig, title="账本")
     billing: BillingConfig = Field(default_factory=BillingConfig, title="计费模式")
+    pricing: PricingConfig = Field(default_factory=PricingConfig, title="牌价计费")
     # audio: AudioConfig = Field(default_factory=AudioConfig, title="音频")
 
 
@@ -193,6 +253,7 @@ class ExpensesSummaryPlugin(MaiBotPlugin):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._scheduler_task: Optional[asyncio.Task] = None
+        self._pricing_task: Optional[asyncio.Task] = None
         self._fallback_config = ExpensesSummaryConfig()
 
     async def on_load(self) -> None:
@@ -209,15 +270,21 @@ class ExpensesSummaryPlugin(MaiBotPlugin):
         if config.scheduler.enabled:
             self._scheduler_task = asyncio.create_task(self._scheduler_loop())
             _log(self.ctx, "info", f"定时财报已启用，将在每天 {config.scheduler.time} 发送")
+        pricing = getattr(config, "pricing", None)
+        if pricing is not None and pricing.enabled and pricing.auto_refresh:
+            self._pricing_task = asyncio.create_task(self._pricing_loop())
+            _log(self.ctx, "info", f"官方牌价自动抓取已启用，每天 {pricing.refresh_time} 执行")
 
     async def on_unload(self) -> None:
-        if self._scheduler_task:
-            self._scheduler_task.cancel()
-            try:
-                await self._scheduler_task
-            except asyncio.CancelledError:
-                pass
-            self._scheduler_task = None
+        for attribute in ("_scheduler_task", "_pricing_task"):
+            task = getattr(self, attribute, None)
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                setattr(self, attribute, None)
 
     async def on_config_update(self, *args: Any, **kwargs: Any) -> None:
         new_config = _extract_updated_config(args, kwargs)
@@ -413,6 +480,15 @@ class ExpensesSummaryPlugin(MaiBotPlugin):
             f"📊 累计账本：投喂 {donation:.2f} 元，开销 {cost:.2f} 元，净收入 {net:+.2f} 元",
             f"今日开销 {today_cost:.2f} 元，今日投喂 {today_donation:.2f} 元",
         ]
+        manual = _ledger_manual()
+        est_donation, est_cost, _est_net = _ledger_estimated_summary()
+        cost_adjust = float(manual.get("cost_adjustment") or 0.0)
+        donation_adjust = float(manual.get("donation_adjustment") or 0.0)
+        if cost_adjust or donation_adjust:
+            lines.append(
+                f"口径：开销＝估算 {est_cost:.2f}＋修正 {cost_adjust:+.2f}；"
+                f"投喂＝累计 {est_donation:.2f}＋修正 {donation_adjust:+.2f}"
+            )
         if today_donations:
             lines.append(
                 "今日明细：" + "；".join(
@@ -475,10 +551,275 @@ class ExpensesSummaryPlugin(MaiBotPlugin):
         await _send_command_response(self.ctx, response, target_stream_id)
         return True, response, True
 
+    async def _pricing_loop(self) -> None:
+        """首次没有生效牌价时先抓一次，之后每天在 refresh_time 抓。"""
+        try:
+            if not _active_price_models():
+                _log(self.ctx, "info", "未找到生效牌价，20 秒后执行首次抓取")
+                await asyncio.sleep(20)
+                await _refresh_prices(self.ctx, self._get_config())
+        except Exception as exc:
+            _log(self.ctx, "error", f"首次抓取牌价失败: {exc}")
+        try:
+            config = self._get_config()
+            marker = _load_prices().get("ledger_rebuild") or {}
+            if (
+                bool(getattr(getattr(config, "pricing", None), "rebuild_ledger", False))
+                and _active_price_models()
+                and int(marker.get("version") or 0) < _REBUILD_VERSION
+            ):
+                _log(self.ctx, "info", "账本重算口径已更新，重新执行一次重算")
+                _maybe_rebuild_ledger(self.ctx, config, _active_price_models(), force=True)
+        except Exception as exc:
+            _log(self.ctx, "error", f"账本重算检查失败: {exc}")
+        while True:
+            config = self._get_config()
+            pricing = getattr(config, "pricing", None)
+            if pricing is None or not pricing.enabled or not pricing.auto_refresh:
+                return
+            await asyncio.sleep(_seconds_until(pricing.refresh_time))
+            try:
+                await _refresh_prices(self.ctx, self._get_config())
+            except Exception as exc:
+                _log(self.ctx, "error", f"牌价抓取失败: {exc}")
+
+    @Command(
+        name="pricing_show",
+        description="查看当前生效的官方牌价表",
+        pattern=r"^/(?:价格|pricing)$",
+    )
+    async def pricing_show_command(
+        self,
+        ctx: Any = None,
+        message: Any = None,
+        stream_id: Optional[str] = None,
+        chat_stream: Any = None,
+        *_args: Any,
+        **kwargs: Any,
+    ) -> tuple[bool, str, bool]:
+        target_stream_id = _first_present(
+            stream_id,
+            _get_stream_id(ctx),
+            _get_stream_id(message),
+            _get_stream_id(chat_stream),
+            _get_stream_id(kwargs),
+        )
+        config = self._get_config()
+        if not _is_admin(config, ctx, message, kwargs):
+            response = "你没有权限查看价格表"
+            await _send_command_response(self.ctx, response, target_stream_id)
+            return True, response, True
+        prices = _load_prices()
+        image = await _render_price_card(self.ctx, prices, config)
+        if _extract_image_base64(image):
+            nickname = (config.report.nickname or "").strip() or (await _resolve_bot_nickname(self.ctx)) or "麦麦"
+            nodes = [
+                _make_forward_node("text", "官方牌价表（发 /价格刷新 可立即更新）", nickname=nickname),
+                _image_node(image, nickname=nickname),
+            ]
+            if await _send_forward(self.ctx, nodes, target_stream_id):
+                return True, "已发送官方牌价表", True
+        response = _describe_prices(prices)
+        await _send_command_response(self.ctx, response, target_stream_id)
+        return True, response, True
+
+    @Command(
+        name="pricing_refresh",
+        description="立即抓取一次官方价格页",
+        pattern=r"^/(?:价格刷新|pricingrefresh)$",
+    )
+    async def pricing_refresh_command(
+        self,
+        ctx: Any = None,
+        message: Any = None,
+        stream_id: Optional[str] = None,
+        chat_stream: Any = None,
+        *_args: Any,
+        **kwargs: Any,
+    ) -> tuple[bool, str, bool]:
+        target_stream_id = _first_present(
+            stream_id,
+            _get_stream_id(ctx),
+            _get_stream_id(message),
+            _get_stream_id(chat_stream),
+            _get_stream_id(kwargs),
+        )
+        config = self._get_config()
+        if not _is_admin(config, ctx, message, kwargs):
+            response = "你没有权限刷新价格表"
+            await _send_command_response(self.ctx, response, target_stream_id)
+            return True, response, True
+        await _send_command_response(self.ctx, "开始抓取官方价格页，稍后回报结果…", target_stream_id)
+        try:
+            result = await _refresh_prices(self.ctx, config)
+        except Exception as exc:
+            result = {"applied": False, "reason": f"抓取异常: {exc}"}
+        if result.get("applied"):
+            response = "牌价表已更新：v{}，{models} 个模型，本次变化 {change_percent}%".format(
+                result.get("version"), result.get("models"), result.get("change_percent")
+            )
+            if result.get("rebuild"):
+                response += f"\n{result['rebuild']}"
+        elif result.get("pending"):
+            response = "变化 {change_percent}% 超过阈值，已挂起。回复 /价格确认 应用，/价格否决 丢弃。".format(
+                change_percent=result.get("change_percent")
+            )
+        else:
+            response = f"本次未更新：{result.get('reason', '未知原因')}"
+        await _send_command_response(self.ctx, response, target_stream_id)
+        return True, response, True
+
+    @Command(
+        name="pricing_confirm",
+        description="应用挂起的牌价变更",
+        pattern=r"^/(?:价格确认|pricingconfirm)$",
+    )
+    async def pricing_confirm_command(
+        self,
+        ctx: Any = None,
+        message: Any = None,
+        stream_id: Optional[str] = None,
+        chat_stream: Any = None,
+        *_args: Any,
+        **kwargs: Any,
+    ) -> tuple[bool, str, bool]:
+        target_stream_id = _first_present(
+            stream_id,
+            _get_stream_id(ctx),
+            _get_stream_id(message),
+            _get_stream_id(chat_stream),
+            _get_stream_id(kwargs),
+        )
+        config = self._get_config()
+        if not _is_admin(config, ctx, message, kwargs):
+            response = "你没有权限确认价格变更"
+            await _send_command_response(self.ctx, response, target_stream_id)
+            return True, response, True
+        applied = _apply_pending_prices()
+        if applied is None:
+            response = "当前没有挂起的牌价变更。"
+        else:
+            response = "已应用挂起的牌价表 v{}（变化 {}%）。".format(
+                applied.get("version"), applied.get("change_percent", 0)
+            )
+            rebuild_note = _maybe_rebuild_ledger(self.ctx, config, applied.get("models") or {})
+            if rebuild_note:
+                response += f"\n{rebuild_note}"
+        await _send_command_response(self.ctx, response, target_stream_id)
+        return True, response, True
+
+    @Command(
+        name="pricing_reject",
+        description="丢弃挂起的牌价变更",
+        pattern=r"^/(?:价格否决|pricingreject)$",
+    )
+    async def pricing_reject_command(
+        self,
+        ctx: Any = None,
+        message: Any = None,
+        stream_id: Optional[str] = None,
+        chat_stream: Any = None,
+        *_args: Any,
+        **kwargs: Any,
+    ) -> tuple[bool, str, bool]:
+        target_stream_id = _first_present(
+            stream_id,
+            _get_stream_id(ctx),
+            _get_stream_id(message),
+            _get_stream_id(chat_stream),
+            _get_stream_id(kwargs),
+        )
+        config = self._get_config()
+        if not _is_admin(config, ctx, message, kwargs):
+            response = "你没有权限丢弃价格变更"
+            await _send_command_response(self.ctx, response, target_stream_id)
+            return True, response, True
+        response = "已丢弃挂起的牌价变更。" if _reject_pending_prices() else "当前没有挂起的牌价变更。"
+        await _send_command_response(self.ctx, response, target_stream_id)
+        return True, response, True
+
+    @Command(
+        name="cost_adjust",
+        description="设置实际总消耗的修正量",
+        pattern=r"^/(?:消耗修正|花费修正|实际消耗|实际总消耗|costfix)(?:\s+(?P<value>\S+))?$",
+    )
+    async def cost_adjust_command(
+        self,
+        ctx: Any = None,
+        message: Any = None,
+        stream_id: Optional[str] = None,
+        chat_stream: Any = None,
+        *_args: Any,
+        **kwargs: Any,
+    ) -> tuple[bool, str, bool]:
+        target_stream_id = _first_present(
+            stream_id,
+            _get_stream_id(ctx),
+            _get_stream_id(message),
+            _get_stream_id(chat_stream),
+            _get_stream_id(kwargs),
+        )
+        config = self._get_config()
+        if not _is_admin(config, ctx, message, kwargs):
+            response = "你没有权限修正实际消耗"
+            await _send_command_response(self.ctx, response, target_stream_id)
+            return True, response, True
+        words = ["消耗修正", "花费修正", "实际消耗", "实际总消耗", "costfix"]
+        token = _extract_command_token(message, kwargs, words)
+        value, add, error = _parse_adjustment(token)
+        if error:
+            response = f"{error}\n用法：/消耗修正 120.5（设定）或 /消耗修正 +50（累加）或 /消耗修正 清空"
+            await _send_command_response(self.ctx, response, target_stream_id)
+            return True, response, True
+        if token:
+            _set_ledger_adjustment("cost_adjustment", value, add=add)
+        response = _describe_ledger_manual()
+        await _send_command_response(self.ctx, response, target_stream_id)
+        return True, response, True
+
+    @Command(
+        name="donation_adjust",
+        description="设置实际总捐赠的修正量",
+        pattern=r"^/(?:捐赠修正|投喂修正|实际捐赠|实际总捐赠|donationfix)(?:\s+(?P<value>\S+))?$",
+    )
+    async def donation_adjust_command(
+        self,
+        ctx: Any = None,
+        message: Any = None,
+        stream_id: Optional[str] = None,
+        chat_stream: Any = None,
+        *_args: Any,
+        **kwargs: Any,
+    ) -> tuple[bool, str, bool]:
+        target_stream_id = _first_present(
+            stream_id,
+            _get_stream_id(ctx),
+            _get_stream_id(message),
+            _get_stream_id(chat_stream),
+            _get_stream_id(kwargs),
+        )
+        config = self._get_config()
+        if not _is_admin(config, ctx, message, kwargs):
+            response = "你没有权限修正实际捐赠"
+            await _send_command_response(self.ctx, response, target_stream_id)
+            return True, response, True
+        words = ["捐赠修正", "投喂修正", "实际捐赠", "实际总捐赠", "donationfix"]
+        token = _extract_command_token(message, kwargs, words)
+        value, add, error = _parse_adjustment(token)
+        if error:
+            response = f"{error}\n用法：/捐赠修正 300（设定）或 /捐赠修正 -30（累加）或 /捐赠修正 清空"
+            await _send_command_response(self.ctx, response, target_stream_id)
+            return True, response, True
+        if token:
+            _set_ledger_adjustment("donation_adjustment", value, add=add)
+        response = _describe_ledger_manual()
+        await _send_command_response(self.ctx, response, target_stream_id)
+        return True, response, True
+
     async def _send_report(self, ctx: Any, stream_id: Optional[str] = None) -> bool:
         config = self._get_config()
         mode = _normalize_mode(config.report.mode)
-        data = await _collect_report_data(ctx)
+        data = await _collect_report_data(ctx, config)
         _apply_billing(config, data)
         _record_today_cost(data.total_cost)
         image = await _render_report_image(ctx, data, mode, config.report.title, ledger_enabled=config.ledger.enabled)
@@ -553,7 +894,7 @@ async def _resolve_bot_nickname(ctx: Any) -> str:
     return ""
 
 
-async def _collect_report_data(ctx: Any) -> ReportData:
+async def _collect_report_data(ctx: Any, config: Optional[ExpensesSummaryConfig] = None) -> ReportData:
     local = _resolve_statistics_api(ctx)
     if local is None:
         _log(ctx, "warning", "财报统计失败: statistics API 不可用")
@@ -569,13 +910,37 @@ async def _collect_report_data(ctx: Any) -> ReportData:
 
     model_costs = _merge_model_stats(None, costs_raw, requests_raw, today_only=True)
     total_requests = sum(item.requests for item in model_costs)
-    total_cost = sum(item.cost for item in model_costs)
+    native_total = sum(item.cost for item in model_costs)
     total_replies = _series_total(messages_raw, today_only=True)
 
     if total_requests <= 0:
         total_requests = _series_total(requests_raw, today_only=True)
-    if total_cost <= 0:
-        total_cost = _series_total(costs_raw, today_only=True)
+    if native_total <= 0:
+        native_total = _series_total(costs_raw, today_only=True)
+
+    total_cost = native_total
+    cost_note = ""
+    usage_from_prices = False
+
+    pricing = getattr(config, "pricing", None) if config is not None else None
+    if pricing is not None and bool(getattr(pricing, "enabled", False)):
+        db_path = _resolve_db_path()
+        if db_path is None:
+            cost_note = "未找到账单数据库，成本沿用麦麦原生口径"
+        else:
+            try:
+                engine_total, per_name, note, warnings = await _report_cost_by_prices(ctx, config, db_path)
+            except Exception as exc:
+                engine_total, per_name, note, warnings = None, {}, "", [f"牌价计价异常: {exc}"]
+            if engine_total is None:
+                cost_note = _merge_cost_note("牌价缺失，成本沿用麦麦原生口径", "；".join(warnings))
+            else:
+                total_cost = engine_total
+                for item in model_costs:
+                    if item.name in per_name:
+                        item.cost = per_name[item.name]
+                cost_note = _merge_cost_note(note, "；".join(warnings))
+                usage_from_prices = True
 
     return ReportData(
         date_text=datetime.now().strftime("%Y年%m月%d日"),
@@ -583,6 +948,8 @@ async def _collect_report_data(ctx: Any) -> ReportData:
         total_replies=total_replies,
         total_cost=total_cost,
         model_costs=sorted(model_costs, key=lambda item: item.cost, reverse=True),
+        cost_note=cost_note,
+        usage_from_prices=usage_from_prices,
     )
 
 
@@ -719,6 +1086,15 @@ def _get_exchange_rate(billing: Any, today: Optional[date] = None) -> float:
     return 0.0
 
 
+def _merge_cost_note(existing: str, new: str) -> str:
+    """保留已有成本口径说明，把新的追加在后面，避免流程互相覆盖。"""
+    first = str(existing or "").strip(" ；;")
+    second = str(new or "").strip(" ；;")
+    if first and second:
+        return f"{first}；{second}"
+    return first or second
+
+
 def _apply_billing(config: ExpensesSummaryConfig, data: ReportData) -> None:
     """按计费模式调整财报成本口径（修改 data 的 total_cost / cost_note / 模型 subscribed）。"""
     billing = config.billing
@@ -757,7 +1133,9 @@ def _apply_billing(config: ExpensesSummaryConfig, data: ReportData) -> None:
         for item in data.model_costs:
             item.subscribed = True
         data.total_cost = period_cost
-        data.cost_note = f"订阅口径：本期 {spend_text}，{period_text}，{spread_text}，今日成本 {period_cost:.4f} 元"
+        data.cost_note = _merge_cost_note(
+            data.cost_note, f"订阅口径：本期 {spend_text}，{period_text}，{spread_text}，今日成本 {period_cost:.4f} 元"
+        )
         return
 
     if mode in ("hybrid", "混合"):
@@ -766,12 +1144,14 @@ def _apply_billing(config: ExpensesSummaryConfig, data: ReportData) -> None:
             if keys and any(k in str(item.name).lower() for k in keys):
                 item.subscribed = True
                 item.cost = 0.0
-        data.total_cost = period_cost + sum(item.cost for item in data.model_costs)
+        usage_total = data.total_cost if data.usage_from_prices else sum(item.cost for item in data.model_costs)
+        data.total_cost = period_cost + usage_total
         sub_count = sum(1 for item in data.model_costs if item.subscribed)
-        data.cost_note = (
+        data.cost_note = _merge_cost_note(
+            data.cost_note,
             f"混合口径：本期订阅 {spend_text}，{period_text}，{spread_text}"
             + (f"；{sub_count} 个订阅模型不计按量，" if sub_count else "")
-            + "其余按量计费。"
+            + "其余按量计费。",
         )
 
 
@@ -831,12 +1211,18 @@ async def _generate_fun_elements(ctx: Any, config: ExpensesSummaryConfig) -> Fun
     )
 
 
-async def _call_llm_generate(generate: Callable, prompt: str, llm_task: str) -> Any:
+async def _call_llm_generate(
+    generate: Callable,
+    prompt: str,
+    llm_task: str,
+    max_tokens: int = 180,
+    temperature: float = 0.8,
+) -> Any:
     call_specs = (
-        ((), {"prompt": prompt, "model": llm_task, "temperature": 0.8, "max_tokens": 180}),
-        ((), {"prompt": prompt, "model": llm_task, "temperature": 0.8}),
-        ((prompt,), {"model": llm_task, "temperature": 0.8, "max_tokens": 180}),
-        ((prompt,), {"model": llm_task, "temperature": 0.8}),
+        ((), {"prompt": prompt, "model": llm_task, "temperature": temperature, "max_tokens": max_tokens}),
+        ((), {"prompt": prompt, "model": llm_task, "temperature": temperature}),
+        ((prompt,), {"model": llm_task, "temperature": temperature, "max_tokens": max_tokens}),
+        ((prompt,), {"model": llm_task, "temperature": temperature}),
         ((prompt,), {"model": llm_task}),
     )
     last_type_error: Optional[TypeError] = None
@@ -1130,6 +1516,10 @@ def _build_report_html(data: ReportData, mode: str, title: str, ledger_enabled: 
     cost_note_html = f'<div class="cost-note">{html.escape(data.cost_note)}</div>' if data.cost_note else ""
     if ledger_enabled:
         donation, cost, net = _ledger_summary()
+        manual = _ledger_manual()
+        est_donation, est_cost, _est_net = _ledger_estimated_summary()
+        cost_adjust = float(manual.get("cost_adjustment") or 0.0)
+        donation_adjust = float(manual.get("donation_adjustment") or 0.0)
         if donation > 0 or cost > 0:
             ledger_block = f"""
   <div class="ledger-strip">
@@ -1137,6 +1527,13 @@ def _build_report_html(data: ReportData, mode: str, title: str, ledger_enabled: 
     <div class="ledger-item"><div class="ledger-label">累计开销</div><div class="ledger-value">{cost:.2f} 元</div></div>
     <div class="ledger-item"><div class="ledger-label">净收入</div><div class="ledger-value">{net:+.2f} 元</div></div>
   </div>"""
+        adjust_bits = []
+        if cost_adjust:
+            adjust_bits.append(f"开销＝估算 {est_cost:.2f} ＋ 人工修正 {cost_adjust:+.2f}")
+        if donation_adjust:
+            adjust_bits.append(f"投喂＝累计 {est_donation:.2f} ＋ 人工修正 {donation_adjust:+.2f}")
+        if adjust_bits:
+            ledger_block += f'\n  <div class="ledger-note">{"；".join(adjust_bits)}</div>'
         net_footer = f"净收入：{net:+.2f} 元（累计投喂 {donation:.2f} 元，累计开销 {cost:.2f} 元）。"
 
     return f"""<!doctype html>
@@ -1278,6 +1675,11 @@ h1 {{
   font-size: 34px;
   font-weight: 700;
   color: #ffffff;
+}}
+.ledger-note {{
+  margin-top: 10px;
+  font-size: 19px;
+  color: #8a979b;
 }}
 .cost-note {{
   margin-top: 8px;
@@ -1432,9 +1834,16 @@ def _build_thanks(
         thanks_suffix = ""
 
     donation, cost, net = _ledger_summary()
+    manual = _ledger_manual()
+    adjust_mark = ""
+    if float(manual.get("cost_adjustment") or 0.0) or float(manual.get("donation_adjustment") or 0.0):
+        adjust_mark = "（含人工修正）"
     ledger_line = ""
     if config.ledger.enabled and (donation > 0 or cost > 0):
-        ledger_line = f"📊 累计账本：投喂 {donation:.2f} 元，开销 {cost:.2f} 元，净收入 {net:+.2f} 元。\n\n"
+        ledger_line = (
+            f"📊 累计账本：投喂 {donation:.2f} 元，开销 {cost:.2f} 元，"
+            f"净收入 {net:+.2f} 元{adjust_mark}。\n\n"
+        )
 
     return _render_template(
         template,
@@ -1452,6 +1861,1273 @@ def _build_thanks(
 # --------------------------------------------------------------------------- #
 # 账本（JSON 记账）
 # --------------------------------------------------------------------------- #
+
+# ---------------------------------------------------------------------------
+# v2.0.0 官方牌价引擎
+#
+# 麦麦自带的 statistics 能力只开放 request/cost/latency/total_tokens 四种口径，
+# 拿不到「缓存命中 / 缓存未命中」的拆分，而命中价往往只有未命中价的几十分之一。
+# 所以成本改为：直接只读 llm_usage 表 -> 按小时桶聚合 -> 套官方价带算钱。
+# 抓取用确定性代码，解析用 LLM，校验与闸门放在两者之间。
+# ---------------------------------------------------------------------------
+
+PRICING_FILENAME = "prices.json"
+PRICING_SCHEMA = 1
+PRICING_HISTORY_LIMIT = 20
+
+DEFAULT_PRICE_SOURCES: dict[str, dict[str, str]] = {
+    "DeepSeek": {
+        "label": "DeepSeek 官方",
+        "url": "https://api-docs.deepseek.com/quick_start/pricing",
+    },
+    "SiliconFlow": {
+        "label": "硅基流动",
+        "url": "https://siliconflow.cn/pricing",
+    },
+}
+
+# 页面上的写法与本地模型名的对应提示，交给解析模型参考，避免它把价格接错模型
+DEFAULT_MODEL_ALIASES: dict[tuple[str, str], list[str]] = {
+    ("DeepSeek", "deepseek-v4-flash"): ["deepseek-flash", "DeepSeek-V4.1-Flash", "deepseek-v4-flash"],
+    ("DeepSeek", "deepseek-v4-pro"): ["deepseek-v4-pro", "DeepSeek-V4-Pro"],
+    ("SiliconFlow", "deepseek-ai/DeepSeek-V4-Flash"): ["DeepSeek-V4-Flash", "deepseek-ai/DeepSeek-V4-Flash"],
+    ("SiliconFlow", "Qwen/Qwen3.5-35B-A3B"): ["Qwen3.5-35B-A3B", "Qwen/Qwen3.5-35B-A3B"],
+}
+
+_PRICE_FETCH_TIMEOUT = 20
+_PRICE_FETCH_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) MaiBot-Expenses-Summary/2.0"
+_PRICE_PAGE_MAX_CHARS = 16000
+# 价格 JSON 比财报文案长得多，必须给足输出上限，否则会被截断成半截 JSON
+_PRICE_LLM_MAX_TOKENS = 2400
+_PRICE_LLM_TEMPERATURE = 0.2
+# 命中关键词后向下多保留多少行：供应商一个模型的价格常跨多个时段/档位，窗口太小会把数字截掉
+_PRICE_TRIM_LOOKAHEAD = 16
+_PRICE_TARGET_LOOKBACK_DAYS = 30
+_TZ_FALLBACK_OFFSETS = {"UTC": 0.0, "Asia/Shanghai": 8.0, "Asia/Tokyo": 9.0}
+
+
+def _pricing_path() -> Path:
+    path = _data_dir() / PRICING_FILENAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _empty_prices() -> dict[str, Any]:
+    return {"schema": PRICING_SCHEMA, "active": None, "pending": None, "history": [], "ledger_rebuild": None}
+
+
+def _load_prices() -> dict[str, Any]:
+    path = _pricing_path()
+    if not path.exists():
+        return _empty_prices()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return _empty_prices()
+    if not isinstance(data, dict):
+        return _empty_prices()
+    data.setdefault("schema", PRICING_SCHEMA)
+    data.setdefault("active", None)
+    data.setdefault("pending", None)
+    data.setdefault("history", [])
+    data.setdefault("ledger_rebuild", None)
+    return data
+
+
+def _save_prices(data: dict[str, Any]) -> None:
+    _pricing_path().write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _price_key(provider: str, model: str) -> str:
+    return f"{str(provider).strip()}||{str(model).strip()}"
+
+
+def _split_price_key(key: str) -> tuple[str, str]:
+    provider, _, model = str(key).partition("||")
+    return provider.strip(), model.strip()
+
+
+def _now_text() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _active_price_models(prices: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    prices = prices if isinstance(prices, dict) else _load_prices()
+    active = prices.get("active") or {}
+    models = active.get("models") if isinstance(active, dict) else None
+    return models if isinstance(models, dict) else {}
+
+
+def _price_source_map(config: Any = None) -> dict[str, dict[str, str]]:
+    """内置价格源 + 配置覆盖（配置格式：供应商=页面地址）。"""
+    sources = {name: dict(meta) for name, meta in DEFAULT_PRICE_SOURCES.items()}
+    overrides = _config_list(getattr(getattr(config, "pricing", None), "sources", None))
+    for item in overrides:
+        name, _, url = str(item).partition("=")
+        name, url = name.strip(), url.strip()
+        if not name or not url:
+            continue
+        sources.setdefault(name, {"label": name})
+        sources[name]["url"] = url
+    return sources
+
+
+# ---------------------------------------------------------------------------
+# 抓取与解析
+# ---------------------------------------------------------------------------
+
+
+def _price_http_get(url: str, timeout: int = _PRICE_FETCH_TIMEOUT) -> str:
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": _PRICE_FETCH_UA, "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"},
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as resp:
+        raw = resp.read()
+    for encoding in ("utf-8", "gbk", "latin-1"):
+        try:
+            return raw.decode(encoding)
+        except Exception:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
+def _price_html_to_text(doc: str) -> str:
+    text = re.sub(r"(?is)<script.*?</script>", " ", doc)
+    text = re.sub(r"(?is)<style.*?</style>", " ", text)
+    text = re.sub(r"(?s)<[^>]+>", "\n", text)
+    text = html.unescape(text)
+    lines = [line.strip() for line in text.splitlines()]
+    return "\n".join(line for line in lines if line)
+
+
+def _price_trim_for_targets(page_text: str, needles: list[str]) -> str:
+    """控制嗂给模型的页面体量。
+
+    页面去标签后如果本来就够短，整页递过去：供应商常把价格表放在离模型名很远的地方
+    （如 DeepSeek 的文档页），按关键词开窗口反而会把真正的数字裁掉。
+    """
+    if len(page_text) <= _PRICE_PAGE_MAX_CHARS:
+        return page_text
+    clean = [item for item in needles if item]
+    if not clean:
+        return page_text[:_PRICE_PAGE_MAX_CHARS]
+    lines = page_text.splitlines()
+    lowered = [line.lower() for line in lines]
+    keep: set[int] = set()
+    for index, line in enumerate(lowered):
+        if any(needle.lower() in line for needle in clean):
+            for offset in range(0, _PRICE_TRIM_LOOKAHEAD):
+                if index + offset < len(lines):
+                    keep.add(index + offset)
+    if not keep:
+        return page_text[:_PRICE_PAGE_MAX_CHARS]
+    return "\n".join(lines[i] for i in sorted(keep))[:_PRICE_PAGE_MAX_CHARS]
+
+
+def _price_alias_hints(config: Any, provider: str, model: str) -> list[str]:
+    hints = list(DEFAULT_MODEL_ALIASES.get((provider, model), []))
+    if model not in hints:
+        hints.append(model)
+    return hints
+
+
+def _build_price_prompt(
+    source_label: str,
+    url: str,
+    targets: list[tuple[str, str]],
+    aliases: dict[tuple[str, str], list[str]],
+    page_text: str,
+) -> str:
+    rows = []
+    for provider, model in targets:
+        hints = aliases.get((provider, model)) or [model]
+        rows.append(f"- {provider} :: {model}（页面上可能写作：{' / '.join(hints)}）")
+    schema = (
+        '{"models": {"<供应商>::<模型>": {"currency": "CNY或USD", '
+        '"tiers": null或[输入token整数阈值升序], '
+        '"bands": [{"tz": "Asia/Shanghai或UTC", "hours": null或[[起,止]], '
+        '"weekdays": null或[0-6,周一为0], "tier": 0, '
+        '"cache_hit": 数字, "cache_miss": 数字, "output": 数字}], "note": "可选"}}}'
+    )
+    return (
+        f"你是价格数据提取器。下面是从「{source_label}」（{url}）抓到的页面文本。\n\n"
+        "请为下列每一个「供应商 :: 模型」找出它的完整计费规则：\n"
+        + "\n".join(rows)
+        + "\n\n输出要求：\n"
+        "1. 只输出 JSON，不要解释，不要 Markdown 代码块。\n"
+        f"2. 结构必须是：{schema}\n"
+        "3. 单价单位统一为「每 100 万 token 的价格」，照抄页面原始数字，不要换算币种。\n"
+        "4. 分时段定价拆成多个 band：优惠时段写具体 hours，其余时段写 hours 为 null 的兜底 band，兜底 band 放最后。\n"
+        "5. 页面没写缓存命中价时，cache_hit 填 0。\n"
+        "6. tiers 为 null 表示不按输入长度分档；若按输入长度分档，tiers 填阈值升序数组，band 的 tier 标明档位（0 为最低档）。\n"
+        "7. 页面上找不到的模型，直接从结果里省略，不要编造。\n\n"
+        "页面文本：\n<<<\n"
+        f"{page_text}\n>>>"
+    )
+
+
+def _parse_json_blob(text: str) -> Optional[dict]:
+    if not text:
+        return None
+    candidate = str(text).strip()
+    if candidate.startswith("```"):
+        candidate = re.sub(r"^```[a-zA-Z]*\s*", "", candidate)
+        candidate = re.sub(r"\s*```$", "", candidate)
+    for blob in (candidate, _slice_json_object(candidate)):
+        if not blob:
+            continue
+        try:
+            data = json.loads(blob)
+        except Exception:
+            continue
+        if isinstance(data, dict):
+            return data
+    return None
+
+
+def _slice_json_object(text: str) -> str:
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        return text[start : end + 1]
+    return ""
+
+
+def _coerce_price(value: Any) -> Optional[float]:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number or number < 0 or number > 1e6:
+        return None
+    return number
+
+
+def _normalize_bands(raw_bands: Any) -> list[dict[str, Any]]:
+    bands: list[dict[str, Any]] = []
+    if not isinstance(raw_bands, list):
+        return bands
+    for item in raw_bands:
+        if not isinstance(item, dict):
+            continue
+        hit = _coerce_price(item.get("cache_hit"))
+        miss = _coerce_price(item.get("cache_miss"))
+        out = _coerce_price(item.get("output"))
+        if hit is None or miss is None or out is None:
+            continue
+        hours = None
+        raw_hours = item.get("hours")
+        if isinstance(raw_hours, list):
+            parsed: list[list[int]] = []
+            for pair in raw_hours:
+                if isinstance(pair, (list, tuple)) and len(pair) == 2:
+                    try:
+                        h0, h1 = int(pair[0]), int(pair[1])
+                    except (TypeError, ValueError):
+                        continue
+                    if 0 <= h0 < h1 <= 24:
+                        parsed.append([h0, h1])
+            if raw_hours and not parsed:
+                # 声明了时段却全部非法：直接丢弃，绝不允许降级成全时段兜底价
+                continue
+            hours = parsed or None
+        weekdays = None
+        raw_days = item.get("weekdays")
+        if isinstance(raw_days, list):
+            parsed_days = sorted(
+                {int(day) for day in raw_days if isinstance(day, (int, float)) and 0 <= int(day) <= 6}
+            )
+            weekdays = parsed_days or None
+        try:
+            tier = max(0, int(item.get("tier", 0) or 0))
+        except (TypeError, ValueError):
+            tier = 0
+        bands.append(
+            {
+                "tz": str(item.get("tz") or "Asia/Shanghai").strip() or "Asia/Shanghai",
+                "hours": hours,
+                "weekdays": weekdays,
+                "tier": tier,
+                "cache_hit": hit,
+                "cache_miss": miss,
+                "output": out,
+            }
+        )
+    return bands
+
+
+def _band_is_specific(band: dict[str, Any]) -> int:
+    return 0 if (band.get("hours") or band.get("weekdays")) else 1
+
+
+def _normalize_price_entry(raw: Any) -> Optional[dict[str, Any]]:
+    if not isinstance(raw, dict):
+        return None
+    currency = str(raw.get("currency") or "CNY").strip().upper()
+    if currency not in {"CNY", "USD"}:
+        currency = "CNY"
+    bands = _normalize_bands(raw.get("bands"))
+    if not bands:
+        return None
+    bands.sort(key=lambda band: (_band_is_specific(band), int(band.get("tier", 0) or 0)))
+    tiers = None
+    raw_tiers = raw.get("tiers")
+    if isinstance(raw_tiers, list):
+        parsed_tiers = sorted(
+            {int(item) for item in raw_tiers if isinstance(item, (int, float)) and 0 < int(item) < 100_000_000}
+        )
+        tiers = parsed_tiers or None
+    return {
+        "currency": currency,
+        "tiers": tiers,
+        "bands": bands,
+        "note": str(raw.get("note") or "").strip()[:200],
+    }
+
+
+def _normalize_model_payload(payload: Any, targets: list[tuple[str, str]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    raw_models = payload.get("models") if isinstance(payload, dict) else None
+    if not isinstance(raw_models, dict):
+        return result
+    allowed = {_price_key(provider, model) for provider, model in targets}
+    for raw_key, raw_entry in raw_models.items():
+        key = str(raw_key).strip().replace(" :: ", "||").replace("::", "||")
+        if key not in allowed:
+            continue
+        entry = _normalize_price_entry(raw_entry)
+        if entry:
+            result[key] = entry
+    return result
+
+
+def _price_document(
+    models: dict[str, Any],
+    sources: dict[str, Any],
+    *,
+    generated_at: str,
+    extra: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    document = {
+        "version": datetime.now().strftime("%Y%m%d-%H%M%S"),
+        "generated_at": generated_at,
+        "sources": sources,
+        "models": models,
+    }
+    if extra:
+        document.update(extra)
+    return document
+
+
+# ---------------------------------------------------------------------------
+# 价格比对与闸门
+# ---------------------------------------------------------------------------
+
+
+def _flatten_price_points(models: Any) -> dict[str, tuple[float, float, float]]:
+    flat: dict[str, tuple[float, float, float]] = {}
+    if not isinstance(models, dict):
+        return flat
+    for key, entry in models.items():
+        if not isinstance(entry, dict):
+            continue
+        for band in entry.get("bands") or []:
+            if not isinstance(band, dict):
+                continue
+            signature = "{}|{}|{}|{}".format(
+                band.get("tz"), band.get("hours"), band.get("weekdays"), band.get("tier", 0)
+            )
+            flat[f"{key}#{signature}"] = (
+                float(band.get("cache_hit", 0) or 0),
+                float(band.get("cache_miss", 0) or 0),
+                float(band.get("output", 0) or 0),
+            )
+    return flat
+
+
+def _compare_price_tables(old_models: Any, new_models: Any) -> tuple[float, list[str], list[str]]:
+    old_flat = _flatten_price_points(old_models)
+    new_flat = _flatten_price_points(new_models)
+    structural: list[str] = []
+    changes: list[str] = []
+    for key in sorted(set(old_flat) - set(new_flat)):
+        structural.append(f"消失 {key}")
+    for key in sorted(set(new_flat) - set(old_flat)):
+        structural.append(f"新增 {key}")
+    max_percent = 0.0
+    for key in sorted(set(old_flat) & set(new_flat)):
+        for label, before, after in zip(
+            ("缓存命中", "缓存未命中", "输出"), old_flat[key], new_flat[key]
+        ):
+            if before <= 0 and after <= 0:
+                continue
+            base = before if before > 0 else after
+            percent = abs(after - before) / base * 100 if base else 0.0
+            if percent > 0.5:
+                changes.append(f"{key} {label} {before:g} → {after:g}（{percent:+.1f}%）")
+            max_percent = max(max_percent, percent)
+    return max_percent, structural, changes
+
+
+# ---------------------------------------------------------------------------
+# 账单读取与计价
+# ---------------------------------------------------------------------------
+
+
+def _resolve_db_path() -> Optional[Path]:
+    candidates: list[Path] = []
+    try:
+        candidates.append(Path(_data_dir()).parents[1] / "MaiBot.db")
+    except Exception:
+        pass
+    try:
+        candidates.append(Path(__file__).resolve().parents[2] / "data" / "MaiBot.db")
+    except Exception:
+        pass
+    for candidate in candidates:
+        try:
+            if candidate.exists() and candidate.stat().st_size > 0:
+                return candidate
+        except Exception:
+            continue
+    return None
+
+
+def _open_usage_db(db_path: Path) -> Any:
+    uri = "file:///" + db_path.as_posix().lstrip("/")
+    connection = sqlite3.connect(uri, uri=True, timeout=10)
+    connection.execute("PRAGMA query_only = 1")
+    return connection
+
+
+def _build_tier_expression(models: Any) -> tuple[str, list[Any]]:
+    """按模型的输入长度档位生成 CASE 表达式，返回 (SQL 片段, 参数)。"""
+    branches: list[str] = []
+    params: list[Any] = []
+    if not isinstance(models, dict):
+        return "0 AS tier", params
+    for key, entry in models.items():
+        tiers = entry.get("tiers") if isinstance(entry, dict) else None
+        if not tiers:
+            continue
+        _provider, model = _split_price_key(key)
+        if not model:
+            continue
+        for index in range(len(tiers), 0, -1):
+            branches.append("WHEN model_name = ? AND prompt_tokens >= ? THEN " + str(index))
+            params.extend([model, int(tiers[index - 1])])
+    if not branches:
+        return "0 AS tier", params
+    return "CASE " + " ".join(branches) + " ELSE 0 END AS tier", params
+
+
+def _query_usage(db_path: Path, start_text: str, end_text: str, models: Any) -> Optional[list[dict[str, Any]]]:
+    tier_sql, tier_params = _build_tier_expression(models)
+    sql = (
+        "SELECT strftime('%Y-%m-%d %H', timestamp) AS bucket, "
+        "model_name, model_assign_name, model_api_provider_name AS provider, "
+        + tier_sql
+        + ", COUNT(*) AS reqs, SUM(prompt_tokens) AS pt, "
+        "SUM(prompt_cache_hit_tokens) AS hit, SUM(prompt_cache_miss_tokens) AS miss, "
+        "SUM(completion_tokens) AS out, SUM(cost) AS native_cost "
+        "FROM llm_usage WHERE timestamp >= ? AND timestamp < ? "
+        "GROUP BY bucket, model_name, provider, tier"
+    )
+    try:
+        connection = _open_usage_db(db_path)
+    except Exception:
+        return None
+    try:
+        cursor = connection.execute(sql, (*tier_params, start_text, end_text))
+        columns = [item[0] for item in cursor.description]
+        return [dict(zip(columns, row)) for row in cursor.fetchall()]
+    except Exception:
+        return None
+    finally:
+        try:
+            connection.close()
+        except Exception:
+            pass
+
+
+def _query_target_models(db_path: Path, days: int = _PRICE_TARGET_LOOKBACK_DAYS) -> Optional[dict[str, list[str]]]:
+    """返回 provider -> 模型名列表；读取失败返回 None（区别于「确实没有记录」的空字典）。"""
+    start_text = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+    sql = (
+        "SELECT DISTINCT model_api_provider_name AS provider, model_name AS model "
+        "FROM llm_usage WHERE timestamp >= ?"
+    )
+    targets: dict[str, list[str]] = {}
+    try:
+        connection = _open_usage_db(db_path)
+    except Exception:
+        return None
+    try:
+        cursor = connection.execute(sql, (start_text,))
+        for provider, model in cursor.fetchall():
+            provider_text = str(provider or "").strip()
+            model_text = str(model or "").strip()
+            if not provider_text or not model_text:
+                continue
+            targets.setdefault(provider_text, [])
+            if model_text not in targets[provider_text]:
+                targets[provider_text].append(model_text)
+    except Exception:
+        return None
+    finally:
+        try:
+            connection.close()
+        except Exception:
+            pass
+    return targets
+
+
+def _parse_bucket_datetime(bucket: Any) -> Optional[datetime]:
+    text = str(bucket or "").strip()
+    for fmt in ("%Y-%m-%d %H", "%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(text, fmt)
+        except Exception:
+            continue
+    return None
+
+
+def _band_local_parts(dt_naive: datetime, tz_name: str) -> tuple[int, int]:
+    """把账本里的本地时间换算到价带时区，返回 (周一为 0 的星期, 小时)。"""
+    name = (tz_name or "").strip() or "Asia/Shanghai"
+    target = None
+    if ZoneInfo is not None:
+        try:
+            target = ZoneInfo(name)
+        except Exception:
+            target = None
+    if target is not None:
+        try:
+            converted = dt_naive.replace(tzinfo=datetime.now().astimezone().tzinfo).astimezone(target)
+            return converted.weekday(), converted.hour
+        except Exception:
+            pass
+    local_offset = datetime.now().astimezone().utcoffset() or timedelta(0)
+    target_offset = timedelta(hours=_TZ_FALLBACK_OFFSETS.get(name, 8.0))
+    converted = dt_naive - local_offset + target_offset
+    return converted.weekday(), converted.hour
+
+
+def _select_band(bands: Any, dt_naive: datetime, tier: int) -> Optional[dict[str, Any]]:
+    for band in bands or []:
+        if not isinstance(band, dict):
+            continue
+        if int(band.get("tier", 0) or 0) != tier:
+            continue
+        weekday, hour = _band_local_parts(dt_naive, str(band.get("tz") or "Asia/Shanghai"))
+        days = band.get("weekdays")
+        if days and weekday not in days:
+            continue
+        hours = band.get("hours")
+        if hours and not any(int(h0) <= hour < int(h1) for h0, h1 in hours):
+            continue
+        return band
+    return None
+
+
+# 重算逻辑的版本号：升位后会在下次插件加载时自动重算一次账本，用于修正口径缺陷
+_REBUILD_VERSION = 3
+
+
+def _compute_cost_range(
+    db_path: Path,
+    models: Any,
+    start_text: str,
+    end_text: str,
+    billing: Any = None,
+    exclude_keywords: Optional[list[str]] = None,
+) -> tuple[Optional[float], dict[str, float], dict[str, float], list[str]]:
+    """返回 (总成本, 按模型, 按天, 警告)。金额单位人民币。"""
+    warnings: list[str] = []
+    rows = _query_usage(db_path, start_text, end_text, models)
+    if rows is None:
+        return None, {}, {}, ["无法读取账单数据库"]
+
+    total = 0.0
+    per_model: dict[str, float] = {}
+    per_day: dict[str, float] = {}
+    missing: set[str] = set()
+    usd_rate = 0.0
+
+    for row in rows:
+        provider = str(row.get("provider") or "")
+        model = str(row.get("model_name") or "")
+        try:
+            tier = int(row.get("tier") or 0)
+        except (TypeError, ValueError):
+            tier = 0
+        native = float(row.get("native_cost") or 0.0)
+        hit = float(row.get("hit") or 0.0)
+        miss = float(row.get("miss") or 0.0)
+        out = float(row.get("out") or 0.0)
+        prompt_tokens = float(row.get("pt") or 0.0)
+        if hit + miss <= 0 and prompt_tokens > 0:
+            miss = prompt_tokens
+        key = _price_key(provider, model)
+        # 订阅模型不计按量（与 hybrid 口径一致）。
+        # 注意：订阅关键词（如 -go）往往只出现在别名里，账单表的 model_name 是真实模型名，
+        # 所以要把供应商 / 真实模型名 / 别名三者拼起来匹配，否则排除会静默失效。
+        if exclude_keywords:
+            identity = "{}|{}|{}".format(provider, model, row.get("model_assign_name") or "")
+            if any(word and word in identity for word in exclude_keywords):
+                continue
+        entry = models.get(key) if isinstance(models, dict) else None
+        day_key = str(row.get("bucket") or "")[:10]
+
+        cost = None
+        if isinstance(entry, dict) and entry.get("bands"):
+            moment = _parse_bucket_datetime(row.get("bucket"))
+            band = _select_band(entry.get("bands"), moment, tier) if moment is not None else None
+            if band is not None:
+                cost = (
+                    hit / 1_000_000 * float(band.get("cache_hit", 0) or 0)
+                    + miss / 1_000_000 * float(band.get("cache_miss", 0) or 0)
+                    + out / 1_000_000 * float(band.get("output", 0) or 0)
+                )
+                if str(entry.get("currency", "CNY")).upper() == "USD":
+                    if usd_rate <= 0:
+                        usd_rate = _get_exchange_rate(billing) if billing is not None else 0.0
+                        if usd_rate <= 0:
+                            usd_rate = float(getattr(billing, "exchange_rate", 0) or 0) or 7.2
+                    cost *= usd_rate
+            else:
+                missing.add(f"{provider}/{model}（无匹配价带）")
+
+        if cost is None:
+            cost = native
+            missing.add(f"{provider}/{model}")
+
+        total += cost
+        per_model[key] = per_model.get(key, 0.0) + cost
+        if day_key:
+            per_day[day_key] = per_day.get(day_key, 0.0) + cost
+
+    if missing:
+        warnings.append("未匹配到牌价，按麦麦原生 cost 兜底：" + "、".join(sorted(missing)[:8]))
+    return total, per_model, per_day, warnings
+
+
+# ---------------------------------------------------------------------------
+# 账本重建
+# ---------------------------------------------------------------------------
+
+
+def _subscription_keywords(config: Any) -> list[str]:
+    """仅在订阅类口径下才需要排除订阅模型的按量部分。"""
+    billing = getattr(config, "billing", None)
+    mode = str(getattr(billing, "mode", "") or "").strip().lower()
+    if mode not in ("hybrid", "混合", "subscription", "订阅"):
+        return []
+    return _config_list(getattr(billing, "subscription_models", None))
+
+
+def _daily_subscription_cost(config: Any, day_text: str) -> float:
+    """该日按计费模式额外计入的订阅费用（人民币），与 _apply_billing 的订阅口径保持一致。"""
+    billing = getattr(config, "billing", None)
+    if billing is None:
+        return 0.0
+    mode = str(getattr(billing, "mode", "") or "").strip().lower()
+    if mode in ("", "usage", "pay_as_you_go", "按量"):
+        return 0.0
+    renew_amount = float(getattr(billing, "renew_amount", 0) or 0)
+    if renew_amount <= 0:
+        return 0.0
+    try:
+        target = datetime.strptime(str(day_text), "%Y-%m-%d").date()
+    except Exception:
+        return 0.0
+    currency = str(getattr(billing, "currency", "usd") or "usd").strip().lower()
+    if currency == "cny":
+        period_cny = renew_amount
+    elif currency == "usd":
+        rate = _get_exchange_rate(billing, target)
+        if rate <= 0:
+            rate = float(getattr(billing, "exchange_rate", 0) or 0) or 7.2
+        period_cny = renew_amount * rate
+    else:
+        return 0.0
+    period_start, period_end = _subscription_period(target, getattr(billing, "renew_day", 15))
+    period_days = max(1, (period_end - period_start).days)
+    if bool(getattr(billing, "share_daily", True)):
+        return period_cny / period_days
+    return period_cny
+
+
+def _rebuild_ledger_by_prices(
+    config: Any,
+    db_path: Path,
+    models: Any,
+    rebuild_from: str = "",
+) -> Optional[dict[str, Any]]:
+    ledger = _load_ledger()
+    records = ledger.get("records")
+    if not isinstance(records, dict):
+        records = {}
+        ledger["records"] = records
+    if not records:
+        return None
+
+    start_day = (rebuild_from or "").strip()
+    if not start_day:
+        start_day = min(records.keys())
+    try:
+        datetime.strptime(start_day, "%Y-%m-%d")
+    except Exception:
+        return None
+
+    end_day = datetime.now().strftime("%Y-%m-%d")
+    billing = getattr(config, "billing", None)
+    subscription_keywords = _subscription_keywords(config)
+    total, _per_model, per_day, _warnings = _compute_cost_range(
+        db_path,
+        models,
+        f"{start_day} 00:00:00",
+        f"{end_day} 23:59:59",
+        billing,
+        exclude_keywords=subscription_keywords,
+    )
+    if total is None:
+        return None
+
+    updated = 0
+    for day_key, usage_cost in per_day.items():
+        entry = records.setdefault(day_key, {"cost": 0.0, "donations": []})
+        if not isinstance(entry, dict):
+            continue
+        # 按量部分用真实牌价，订阅部分按日分摊；两边口径与日常财报保持一致
+        entry["cost"] = round(float(usage_cost) + _daily_subscription_cost(config, day_key), 4)
+        updated += 1
+    _save_ledger(ledger)
+    return {"days": updated, "from": start_day, "to": end_day}
+
+
+# ---------------------------------------------------------------------------
+# 调度与管理员通知
+# ---------------------------------------------------------------------------
+
+
+_PRICE_CARD_CSS = """
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  width: 900px;
+  font-family: "Microsoft YaHei", "PingFang SC", Arial, sans-serif;
+  color: #202124;
+  background: #f4f7f8;
+}
+.sheet { padding: 54px; background: linear-gradient(180deg, #ffffff 0%, #eef4f5 100%); }
+.head { border-left: 10px solid #0f766e; padding-left: 24px; margin-bottom: 30px; }
+.kicker { font-size: 26px; color: #52605f; margin-bottom: 8px; }
+h1 { margin: 0; font-size: 50px; line-height: 1.14; }
+.subtitle { margin-top: 10px; font-size: 24px; color: #56616a; }
+.metrics { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; margin: 30px 0; }
+.metric { background: #ffffff; border: 1px solid #d9e3e4; border-radius: 8px; padding: 20px; }
+.label { font-size: 21px; color: #667478; }
+.value { margin-top: 8px; font-size: 32px; font-weight: 700; color: #0b3b3f; }
+.section-title { font-size: 29px; font-weight: 700; margin: 34px 0 16px; }
+.row { background: #ffffff; border: 1px solid #dce5e6; border-radius: 8px; padding: 18px 22px; margin-bottom: 12px; }
+.row-top { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; }
+.model { font-size: 25px; font-weight: 700; overflow-wrap: anywhere; }
+.badge { flex: 0 0 auto; font-size: 20px; font-weight: 700; color: #0f766e; }
+.band { margin-top: 12px; }
+.band-when { font-size: 21px; color: #657276; margin-bottom: 3px; }
+.band-price { font-size: 23px; font-weight: 600; }
+.band-price em { font-style: normal; color: #0f766e; }
+.free { color: #b45309; font-weight: 700; }
+.pending { margin: 26px 0 0; background: #b45309; border-radius: 10px; padding: 18px 24px; color: #ffffff; font-size: 22px; }
+.footer { margin-top: 32px; padding-top: 18px; border-top: 1px solid #cad7d8; font-size: 21px; line-height: 1.75; color: #52605f; }
+.src-ok { color: #0f766e; font-weight: 700; }
+.src-bad { color: #b91c1c; font-weight: 700; }
+"""
+
+_WEEKDAY_NAMES = ["一", "二", "三", "四", "五", "六", "日"]
+
+
+def _tz_label(tz_name: str) -> str:
+    name = (tz_name or "").strip()
+    if name.upper() == "UTC":
+        return "UTC"
+    if name == "Asia/Shanghai":
+        return "北京时间"
+    return name or "北京时间"
+
+
+def _describe_band_when(band: dict[str, Any], tiers: Optional[list[Any]]) -> str:
+    """把一个价带翻译成人话：什么时候、哪一档适用。"""
+    parts: list[str] = []
+    hours = band.get("hours")
+    weekdays = band.get("weekdays")
+    if hours:
+        ranges = "、".join(f"{int(h0):02d}:00-{int(h1):02d}:00" for h0, h1 in hours)
+        parts.append(f"{_tz_label(str(band.get('tz') or ''))} {ranges}")
+    if weekdays:
+        day_set = {int(day) for day in weekdays}
+        if day_set == {0, 1, 2, 3, 4}:
+            parts.append("工作日")
+        elif len(day_set) == 7:
+            parts.append("每日")
+        else:
+            parts.append("周" + "、".join(_WEEKDAY_NAMES[d] for d in sorted(day_set)))
+    if tiers:
+        tier = int(band.get("tier", 0) or 0)
+        lower = 0 if tier == 0 else int(tiers[tier - 1])
+        if tier < len(tiers):
+            upper = int(tiers[tier]) // 1000
+            parts.append(f"输入 <{upper}k" if lower == 0 else f"输入 {lower // 1000}k~{upper}k")
+        else:
+            parts.append(f"输入 ≥{lower // 1000}k")
+    return " · ".join(parts) if parts else "全部时段"
+
+
+def _band_price_html(band: dict[str, Any], currency: str) -> str:
+    hit = float(band.get("cache_hit", 0) or 0)
+    miss = float(band.get("cache_miss", 0) or 0)
+    out = float(band.get("output", 0) or 0)
+    if hit <= 0 and miss <= 0 and out <= 0:
+        return '<span class="free">免费</span>'
+    return (
+        f'命中 <em>{hit:g}</em> · 未命中 <em>{miss:g}</em> · 输出 <em>{out:g}</em> {html.escape(currency)}'
+        f'<span style="font-size:19px;color:#8a979b"> / 百万 token</span>'
+    )
+
+
+def _build_price_html(prices: dict[str, Any], config: Any = None) -> str:
+    active = prices.get("active") or {}
+    models = active.get("models") if isinstance(active, dict) else None
+    if not isinstance(models, dict) or not models:
+        return (
+            "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"></head>"
+            "<body style=\"font-family:sans-serif;padding:40px\">暂无生效的官方牌价。</body></html>"
+        )
+
+    sources = active.get("sources") if isinstance(active.get("sources"), dict) else {}
+    pending = prices.get("pending") or {}
+    rebuild = prices.get("ledger_rebuild") or {}
+    generated_at = str(active.get("generated_at") or "")
+    version = str(active.get("version") or "?")
+
+    rows_html: list[str] = []
+    for key in sorted(models.keys()):
+        provider, model = _split_price_key(key)
+        entry = models[key] if isinstance(models.get(key), dict) else {}
+        currency = str(entry.get("currency") or "CNY")
+        tiers = entry.get("tiers") or None
+        bands = entry.get("bands") or []
+        bands_html = "".join(
+            '<div class="band"><div class="band-when">{}</div><div class="band-price">{}</div></div>'.format(
+                html.escape(_describe_band_when(band, tiers)), _band_price_html(band, currency)
+            )
+            for band in bands
+            if isinstance(band, dict)
+        )
+        note = str(entry.get("note") or "").strip()
+        note_html = (
+            '<div class="band-when" style="margin-top:10px;color:#8a979b">{}</div>'.format(html.escape(note[:200]))
+            if note
+            else ""
+        )
+        rows_html.append(
+            '<div class="row"><div class="row-top"><div class="model">{} / {}</div>'
+            '<div class="badge">{}</div></div>{}{}</div>'.format(
+                html.escape(provider),
+                html.escape(model),
+                html.escape(currency),
+                bands_html,
+                note_html,
+            )
+        )
+
+    ok_sources = 0
+    source_lines: list[str] = []
+    for name in sorted(sources.keys()):
+        meta = sources[name] if isinstance(sources.get(name), dict) else {}
+        if meta.get("ok"):
+            ok_sources += 1
+            mark = '<span class="src-ok">正常</span>'
+        else:
+            reason = str(meta.get("error") or "未知原因")[:60]
+            mark = f'<span class="src-bad">抓取失败：{html.escape(reason)}</span>'
+        source_lines.append(f"{html.escape(str(name))}（{mark}）")
+
+    footer_extra = ""
+    if isinstance(rebuild, dict) and rebuild.get("done"):
+        footer_extra += "<br>账本已按真实牌价重算 {} 天（{} 起）。".format(
+            int(rebuild.get("days") or 0), html.escape(str(rebuild.get("from") or ""))
+        )
+    pending_html = ""
+    if isinstance(pending, dict) and pending.get("models"):
+        pending_html = '<div class="pending">有挂起变更待确认：变化 {:.1f}%，发 /价格确认 应用。</div>'.format(
+            float(pending.get("change_percent") or 0)
+        )
+
+    return """<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<style>{css}</style>
+</head>
+<body>
+<main class="sheet">
+  <section class="head">
+    <div class="kicker">{generated}</div>
+    <h1>官方牌价表</h1>
+    <div class="subtitle">版本 {version} · 已生效</div>
+  </section>
+  <section class="metrics">
+    <div class="metric"><div class="label">覆盖模型</div><div class="value">{model_count}</div></div>
+    <div class="metric"><div class="label">价格源正常</div><div class="value">{ok_sources}/{src_count}</div></div>
+    <div class="metric"><div class="label">最近抓取</div><div class="value" style="font-size:24px">{generated}</div></div>
+  </section>
+  <div class="section-title">各模型单价</div>
+  {rows}
+  {pending}
+  <div class="footer">
+    来源：{sources_text}{footer_extra}
+  </div>
+</main>
+</body>
+</html>""".format(
+        css=_PRICE_CARD_CSS,
+        generated=html.escape(generated_at),
+        version=html.escape(version),
+        model_count=len(models),
+        ok_sources=ok_sources,
+        src_count=len(sources),
+        rows="\n  ".join(rows_html),
+        pending=pending_html,
+        sources_text="；".join(source_lines) if source_lines else "无",
+        footer_extra=footer_extra,
+    )
+
+
+async def _render_price_card(ctx: Any, prices: dict[str, Any], config: Any = None) -> Any:
+    """把价目表渲染成图片；渲染不可用时返回 None，由调用方退回文字。"""
+    html_doc = _build_price_html(prices, config)
+    renderer = _get_path(ctx, "render")
+    html2png = getattr(renderer, "html2png", None)
+    if not callable(html2png):
+        return None
+    try:
+        return await _maybe_await(
+            html2png(
+                html_doc,
+                selector=".sheet",
+                viewport={"width": 900, "height": 1200},
+                device_scale_factor=1.0,
+                full_page=True,
+            )
+        )
+    except TypeError:
+        try:
+            return await _maybe_await(html2png(html_doc))
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+
+def _describe_prices(prices: Optional[dict[str, Any]] = None) -> str:
+    prices = prices if isinstance(prices, dict) else _load_prices()
+    active = prices.get("active") or {}
+    if not isinstance(active, dict) or not active.get("models"):
+        return "当前还没有生效的官方牌价。发 /价格刷新 手动抓一次，或等下一次定时抓取。"
+
+    lines = [f"官方牌价表 v{active.get('version', '?')}（生成于 {active.get('generated_at', '未知')}）"]
+    for name, meta in (active.get("sources") or {}).items():
+        if not isinstance(meta, dict):
+            continue
+        flag = "正常" if meta.get("ok") else "抓取失败"
+        lines.append(f"· {name}: {flag}（{meta.get('url', '')}）")
+    lines.append("")
+    for key in sorted((active.get("models") or {}).keys()):
+        provider, model = _split_price_key(key)
+        entry = active["models"][key]
+        bands = entry.get("bands") or []
+        head = bands[0] if bands else {}
+        lines.append(
+            "· {} / {}：命中 {g} / 未命中 {g} / 输出 {g} {}（{d} 个价带）".format(
+                provider,
+                model,
+                head.get("cache_hit", 0),
+                head.get("cache_miss", 0),
+                head.get("output", 0),
+                entry.get("currency", "CNY"),
+                len(bands),
+            )
+        )
+    pending = prices.get("pending") or {}
+    if isinstance(pending, dict) and pending.get("models"):
+        lines.append("")
+        lines.append(
+            "有挂起的变更等待确认（变化 {:.1f}%）：发 /价格确认 应用，/价格否决 丢弃。".format(
+                float(pending.get("change_percent") or 0)
+            )
+        )
+    return "\n".join(lines)
+
+
+async def _notify_admins(ctx: Any, config: Any, text: str) -> None:
+    admins = _config_list(getattr(getattr(config, "permission", None), "admins", None))
+    if not admins:
+        _log(ctx, "warning", f"价格变更需要确认，但没有配置管理员，消息未发出：{text}")
+        return
+    for admin_id in admins[:3]:
+        try:
+            stream_id = await _resolve_target_stream_id(ctx, "private", admin_id)
+            if stream_id:
+                await _send_command_response(ctx, text, stream_id)
+        except Exception:
+            continue
+
+
+def _maybe_rebuild_ledger(ctx: Any, config: Any, models: Any, force: bool = False) -> str:
+    """按官方牌价重建账本历史开销。默认只做一次；force=True 时忽略标记强制重算。"""
+    pricing = getattr(config, "pricing", None)
+    if not bool(getattr(pricing, "rebuild_ledger", False)):
+        return ""
+    prices = _load_prices()
+    marker = prices.get("ledger_rebuild") or {}
+    if not force and marker.get("done") and int(marker.get("version") or 0) >= _REBUILD_VERSION:
+        return ""
+    db_path = _resolve_db_path()
+    if db_path is None:
+        return ""
+    rebuilt = _rebuild_ledger_by_prices(
+        config, db_path, models, str(getattr(pricing, "rebuild_from", "") or "")
+    )
+    if not rebuilt:
+        return ""
+    prices = _load_prices()
+    prices["ledger_rebuild"] = {
+        "done": True,
+        "version": _REBUILD_VERSION,
+        "at": _now_text(),
+        "from": rebuilt["from"],
+        "to": rebuilt["to"],
+        "days": rebuilt["days"],
+    }
+    _save_prices(prices)
+    note = f"账本已按官方牌价重算：{rebuilt['from']} ~ {rebuilt['to']}，共 {rebuilt['days']} 天。"
+    _log(ctx, "info", note)
+    return note
+
+
+async def _refresh_prices(ctx: Any, config: Any) -> dict[str, Any]:
+    """抓取 + 解析 + 校验 + 闸门。返回执行摘要。"""
+    pricing = getattr(config, "pricing", None)
+    threshold = float(getattr(pricing, "change_threshold_percent", 20.0) or 20.0)
+    require_confirm = bool(getattr(pricing, "require_admin_confirm", True))
+
+    db_path = _resolve_db_path()
+    if db_path is None:
+        _log(ctx, "error", "牌价抓取中止：找不到账单数据库 MaiBot.db")
+        return {"applied": False, "reason": "找不到账单数据库"}
+    _log(ctx, "info", f"牌价抓取开始，账单库: {db_path}")
+
+    targets_by_provider = _query_target_models(db_path)
+    if targets_by_provider is None:
+        _log(ctx, "error", "牌价抓取中止：账单库读取失败")
+        return {"applied": False, "reason": "账单库读取失败"}
+    if not targets_by_provider:
+        _log(ctx, "warning", "牌价抓取中止：最近没有模型调用记录")
+        return {"applied": False, "reason": "最近没有模型调用记录"}
+    _log(
+        ctx,
+        "info",
+        "牌价目标模型: "
+        + "；".join(f"{provider}({len(models)})" for provider, models in sorted(targets_by_provider.items())),
+    )
+
+    sources = _price_source_map(config)
+    subscription_keywords = _config_list(getattr(getattr(config, "billing", None), "subscription_models", None))
+    llm_task = str(getattr(pricing, "llm_task", "") or "").strip() or _get_llm_task(config)
+    generate = _get_path(ctx, "llm.generate")
+
+    prices = _load_prices()
+    previous_models = _active_price_models(prices)
+    new_models: dict[str, Any] = dict(previous_models)
+    source_report: dict[str, Any] = {}
+
+    for provider, models in targets_by_provider.items():
+        source = sources.get(provider)
+        if source is None:
+            continue
+        wanted = [m for m in models if not any(k and k in m for k in subscription_keywords)]
+        if not wanted:
+            continue
+        url = source.get("url") or ""
+        label = source.get("label") or provider
+        entry: dict[str, Any] = {"url": url, "ok": False, "fetched_at": _now_text()}
+        try:
+            raw_page = _price_http_get(url)
+            page_text = _price_html_to_text(raw_page)
+            targets = [(provider, model) for model in wanted]
+            aliases = {target: _price_alias_hints(config, target[0], target[1]) for target in targets}
+            needles = [hint for hints in aliases.values() for hint in hints]
+            trimmed = _price_trim_for_targets(page_text, needles)
+            if not trimmed.strip():
+                raise ValueError("页面内容为空")
+            prompt = _build_price_prompt(label, url, targets, aliases, trimmed)
+            result = await _maybe_await(
+                _call_llm_generate(
+                    generate,
+                    prompt,
+                    llm_task,
+                    max_tokens=_PRICE_LLM_MAX_TOKENS,
+                    temperature=_PRICE_LLM_TEMPERATURE,
+                )
+            )
+            payload = _parse_json_blob(_normalize_llm_text(result))
+            parsed = _normalize_model_payload(payload, targets)
+            if not parsed:
+                raise ValueError("解析结果为空")
+            new_models.update(parsed)
+            entry["ok"] = True
+            entry["models"] = sorted(parsed.keys())
+            entry["page_chars"] = len(trimmed)
+        except Exception as exc:
+            entry["error"] = str(exc)[:200]
+            _log(ctx, "warning", f"价格源 {provider} 抓取/解析失败: {exc}")
+        source_report[provider] = entry
+
+    if not new_models:
+        _log(ctx, "warning", "牌价抓取结束：本次没有解析出任何可用价格")
+        return {"applied": False, "reason": "本次没有解析出任何可用价格"}
+    _log(ctx, "info", f"牌价解析完成，共 {len(new_models)} 个模型条目")
+
+    max_percent, structural, changes = _compare_price_tables(previous_models, new_models)
+    document = _price_document(
+        new_models,
+        source_report,
+        generated_at=_now_text(),
+        extra={"change_percent": round(max_percent, 2), "structural": structural[:20], "changes": changes[:20]},
+    )
+
+    # 首次建表没有基准可比，本身就等同于「巨大变化」，同样要交给管理员过目
+    need_confirm = require_confirm and (not previous_models or max_percent > threshold or bool(structural))
+    if need_confirm:
+        prices["pending"] = document
+        _save_prices(prices)
+        if structural:
+            detail = "；".join(structural[:5])
+        elif changes:
+            detail = "；".join(changes[:5])
+        else:
+            detail = "无明细"
+        if not previous_models:
+            headline = "首次生成官方牌价表，已挂起等待确认（无基准可比，按巨变处理）。"
+        else:
+            headline = "牌价表出现较大变动，已挂起等待确认。变化幅度 {:.1f}%（阈值 {:.0f}%）".format(
+                max_percent, threshold
+            )
+        await _notify_admins(
+            ctx,
+            config,
+            "{}\n{}\n回复 /价格确认 应用，/价格否决 丢弃。".format(headline, detail),
+        )
+        _log(ctx, "warning", f"牌价表已挂起等待确认：{headline}")
+        return {
+            "applied": False,
+            "pending": True,
+            "change_percent": round(max_percent, 2),
+            "reason": "变化超阈值，等待管理员确认",
+        }
+
+    document["applied_at"] = _now_text()
+    prices["active"] = document
+    prices["pending"] = None
+    history = prices.get("history") if isinstance(prices.get("history"), list) else []
+    history.append(
+        {
+            "version": document["version"],
+            "applied_at": document["applied_at"],
+            "change_percent": round(max_percent, 2),
+            "models": len(new_models),
+        }
+    )
+    prices["history"] = history[-PRICING_HISTORY_LIMIT:]
+    _save_prices(prices)
+    _log(ctx, "info", f"牌价表已更新：v{document['version']}，模型 {len(new_models)} 个，变化 {max_percent:.1f}%")
+
+    rebuild_note = _maybe_rebuild_ledger(ctx, config, new_models)
+
+    return {
+        "applied": True,
+        "version": document["version"],
+        "models": len(new_models),
+        "change_percent": round(max_percent, 2),
+        "rebuild": rebuild_note,
+    }
+
+
+def _apply_pending_prices() -> Optional[dict[str, Any]]:
+    prices = _load_prices()
+    pending = prices.get("pending")
+    if not isinstance(pending, dict) or not pending.get("models"):
+        return None
+    pending["applied_at"] = _now_text()
+    prices["active"] = pending
+    prices["pending"] = None
+    history = prices.get("history") if isinstance(prices.get("history"), list) else []
+    history.append(
+        {
+            "version": pending.get("version"),
+            "applied_at": pending["applied_at"],
+            "change_percent": pending.get("change_percent", 0),
+            "models": len(pending.get("models") or {}),
+            "manual": True,
+        }
+    )
+    prices["history"] = history[-PRICING_HISTORY_LIMIT:]
+    _save_prices(prices)
+    return pending
+
+
+def _reject_pending_prices() -> bool:
+    prices = _load_prices()
+    if not prices.get("pending"):
+        return False
+    prices["pending"] = None
+    _save_prices(prices)
+    return True
+
+
+async def _report_cost_by_prices(
+    ctx: Any,
+    config: Any,
+    db_path: Path,
+) -> tuple[Optional[float], dict[str, float], str, list[str]]:
+    """按官方牌价算今天 0 点至今的成本。返回 (总额, 按模型名, 备注, 警告)。"""
+    prices = _load_prices()
+    active = prices.get("active") or {}
+    models = _active_price_models(prices)
+    if not models:
+        return None, {}, "", []
+    start_text = datetime.now().strftime("%Y-%m-%d 00:00:00")
+    end_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    total, per_key, _per_day, warnings = _compute_cost_range(
+        db_path,
+        models,
+        start_text,
+        end_text,
+        getattr(config, "billing", None),
+        exclude_keywords=_subscription_keywords(config),
+    )
+    if total is None:
+        return None, {}, "", warnings
+    per_name: dict[str, float] = {}
+    for key, value in per_key.items():
+        _provider, model = _split_price_key(key)
+        per_name[model] = per_name.get(model, 0.0) + value
+    note = "成本按官方牌价计算（牌价表 v{}）".format(str(active.get("version") or "?"))
+    return total, per_name, note, warnings
+
 
 LEDGER_FILENAME = "ledger.json"
 
@@ -1542,8 +3218,19 @@ def _record_donation(amount: float, note: str = "") -> tuple[float, float, float
     return _ledger_summary(ledger)
 
 
-def _ledger_summary(ledger: Optional[dict[str, Any]] = None) -> tuple[float, float, float]:
-    ledger = ledger or _load_ledger()
+_ADJUST_CLEAR_WORDS = {"清空", "清除", "重置", "归零", "清零", "auto", "reset", "clear", "0"}
+
+
+def _ledger_manual(ledger: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    """手工修正量（元）。实际总额 = 账本估算/累计 + 修正量。"""
+    ledger = ledger if isinstance(ledger, dict) else _load_ledger()
+    manual = ledger.get("manual")
+    return manual if isinstance(manual, dict) else {}
+
+
+def _ledger_estimated_summary(ledger: Optional[dict[str, Any]] = None) -> tuple[float, float, float]:
+    """估算口径：逐日 cost 之和 + 投喂记录之和。"""
+    ledger = ledger if isinstance(ledger, dict) else _load_ledger()
     total_cost = 0.0
     total_donation = 0.0
     for day in ledger.get("records", {}).values():
@@ -1551,6 +3238,100 @@ def _ledger_summary(ledger: Optional[dict[str, Any]] = None) -> tuple[float, flo
         for item in day.get("donations", []):
             total_donation += float(item.get("amount", 0.0) or 0.0)
     return total_donation, total_cost, total_donation - total_cost
+
+
+def _ledger_summary(ledger: Optional[dict[str, Any]] = None) -> tuple[float, float, float]:
+    """对外口径：账本值 + 手工修正量。"""
+    ledger = ledger if isinstance(ledger, dict) else _load_ledger()
+    donation, cost, _net = _ledger_estimated_summary(ledger)
+    manual = _ledger_manual(ledger)
+    cost += float(manual.get("cost_adjustment") or 0.0)
+    donation += float(manual.get("donation_adjustment") or 0.0)
+    return donation, cost, donation - cost
+
+
+def _set_ledger_adjustment(
+    field: str,
+    value: Optional[float],
+    add: bool = False,
+) -> tuple[float, float, float]:
+    """field 取 cost_adjustment / donation_adjustment；value 为 None 表示清零。
+
+    修正量语义：实际总额 = 账本估算/累计 + 修正量。add=True 时在当前修正量上累加。
+    """
+    ledger = _load_ledger()
+    manual = ledger.get("manual")
+    if not isinstance(manual, dict):
+        manual = {}
+        ledger["manual"] = manual
+    stamp_key = "cost_updated_at" if field == "cost_adjustment" else "donation_updated_at"
+    current = float(manual.get(field) or 0.0)
+    if value is None:
+        manual[field] = 0.0
+        manual.pop(stamp_key, None)
+    else:
+        manual[field] = round(current + float(value) if add else float(value), 2)
+        manual[stamp_key] = _now_text()
+    _save_ledger(ledger)
+    return _ledger_summary(ledger)
+
+
+def _extract_command_token(message: Any, kwargs: dict[str, Any], words: list[str]) -> str:
+    """从命令参数里取出第一个词；兼容 SDK 的命名组与直接解析消息文本。"""
+    token = _get_path(kwargs, "matched_groups.value") or _get_path(kwargs, "groups.value")
+    if token is None:
+        content = ""
+        for path in ("message.content", "content", "text", "raw_message"):
+            content = _get_path(kwargs, path) or _get_path(message, path)
+            if isinstance(content, str) and content.strip():
+                break
+        pattern = r"^/(?:" + "|".join(re.escape(word) for word in words) + r")(?:\s+(\S+))?\s*$"
+        match = re.search(pattern, (content or "").strip())
+        if match:
+            token = match.group(1)
+    return str(token).strip() if token is not None else ""
+
+
+def _parse_adjustment(token: str) -> tuple[Optional[float], bool, Optional[str]]:
+    """返回 (数额, 是否累加, 错误信息)。空串或清零词 -> (None, False, None)。"""
+    text = (token or "").strip()
+    if not text:
+        return None, False, None
+    if text.lower() in _ADJUST_CLEAR_WORDS:
+        return None, False, None
+    add = text[0] in "+-"
+    try:
+        return float(text.lstrip("+")), add, None
+    except ValueError:
+        return None, False, f"无法识别金额：{text}"
+
+
+def _describe_ledger_manual() -> str:
+    manual = _ledger_manual()
+    est_donation, est_cost, _est_net = _ledger_estimated_summary()
+    donation, cost, net = _ledger_summary()
+    cost_adjust = float(manual.get("cost_adjustment") or 0.0)
+    donation_adjust = float(manual.get("donation_adjustment") or 0.0)
+    lines = [
+        "账本口径（实际 = 账本值 + 修正量）：",
+        f"· 实际总消耗：{_money(cost)}",
+        f"    账本估算 {_money(est_cost)}  修正 {cost_adjust:+.2f}",
+        f"· 实际总捐赠：{_money(donation)}",
+        f"    账本累计 {_money(est_donation)}  修正 {donation_adjust:+.2f}",
+        f"· 净收入：{net:+.2f} 元",
+        "",
+        "设定：/消耗修正 120.5　累加：/消耗修正 +50　清零：/消耗修正 清空",
+        "捐赠同：/捐赠修正",
+    ]
+    for key, label in (("cost_updated_at", "消耗"), ("donation_updated_at", "捐赠")):
+        stamp = manual.get(key)
+        if stamp:
+            lines.append(f"（{label}修正于 {stamp}）")
+    return "\n".join(lines)
+
+
+def _money(value: float) -> str:
+    return f"¥{float(value):.2f}"
 
 
 def _extract_ledger_args(message: Any, kwargs: dict[str, Any]) -> tuple[Optional[float], str]:

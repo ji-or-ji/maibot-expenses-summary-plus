@@ -1,5 +1,5 @@
 [plugin]
-config_version = "1.0.4"
+config_version = "2.0.0"
 
 [report]
 mode = "maichenfeng"
@@ -70,3 +70,31 @@ share_daily = true
 subscription_models = ["-go"]
 # usd 计费且自动获取汇率失败时使用的兜底 USD→CNY 汇率
 exchange_rate = 7.2
+
+[pricing]
+# 官方牌价引擎：定期抓取供应商价格页，自行按真实单价计算成本。
+# 为什么不用麦麦自带的价格：其 statistics 能力不对外暴露「缓存命中/未命中」拆分，
+# 而命中价往往只有未命中价的几十分之一，直接用会导致成本被系统性低估。
+enabled = true
+# 是否每天自动抓取
+# 关闭后只能手动发 /价格刷新；此开关不影响财报计算，财报仍会用已抓到的牌价。
+auto_refresh = true
+# 每天抓取时刻（HH:MM）
+refresh_time = "04:10"
+# 解析价格页用的模型任务名；留空用 report.llm_task
+llm_task = "utils"
+# 「巨变」阈值：任一单价相对现役值的涨跌幅超过该百分比，
+# 或者出现新增/消失的价带，就挂起等待管理员确认（/价格确认 应用、/价格否决 丢弃）
+change_threshold_percent = 20.0
+# 关闭后即使超过阈值也直接自动应用
+require_admin_confirm = true
+# 某个模型没有牌价或取数失败时，退回该模型在麦麦里的原生 cost，避免财报开天窗
+fallback_to_native_cost = true
+# 首次生效价格时，用官方牌价重算账本里的历史累计开销（只改 cost，不动投喂记录）
+rebuild_ledger = true
+# 账本重建起始日（YYYY-MM-DD）；留空自动取账本最早一天
+rebuild_from = ""
+# 覆盖内置价格源，格式：供应商=页面地址
+# 内置：DeepSeek=https://api-docs.deepseek.com/quick_start/pricing
+#       SiliconFlow=https://siliconflow.cn/pricing
+sources = []
