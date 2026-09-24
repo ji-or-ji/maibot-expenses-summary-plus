@@ -672,9 +672,19 @@ class ExpensesSummaryPlugin(MaiBotPlugin):
             if result.get("rebuild"):
                 response += f"\n{result['rebuild']}"
         elif result.get("pending"):
-            response = "变化 {change_percent}% 超过阈值，已挂起。回复 /价格确认 应用，/价格否决 丢弃。".format(
-                change_percent=result.get("change_percent")
-            )
+            if result.get("structural_count"):
+                response = "牌价表有 {n} 项结构性变化（新增/移除模型），已挂起。".format(
+                    n=result.get("structural_count")
+                )
+                if result.get("change_percent"):
+                    response += "最大数值变化 {change_percent}%。".format(
+                        change_percent=result.get("change_percent")
+                    )
+            else:
+                response = "变化 {change_percent}% 超过阈值，已挂起。".format(
+                    change_percent=result.get("change_percent")
+                )
+            response += "回复 /价格确认 应用，/价格否决 丢弃。"
         else:
             response = f"本次未更新：{result.get('reason', '未知原因')}"
         await _send_command_response(self.ctx, response, target_stream_id)
@@ -1924,6 +1934,7 @@ DEFAULT_PRICE_SOURCES: dict[str, dict[str, str]] = {
 DEFAULT_MODEL_ALIASES: dict[tuple[str, str], list[str]] = {
     ("DeepSeek", "deepseek-v4-flash"): ["deepseek-flash", "DeepSeek-V4.1-Flash", "deepseek-v4-flash"],
     ("DeepSeek", "deepseek-v4-pro"): ["deepseek-v4-pro", "DeepSeek-V4-Pro"],
+    ("DeepSeek", "deepseek-flash"): ["deepseek-flash", "DeepSeek-V4.1-Flash"],
     ("SiliconFlow", "deepseek-ai/DeepSeek-V4-Flash"): ["DeepSeek-V4-Flash", "deepseek-ai/DeepSeek-V4-Flash"],
     ("SiliconFlow", "Qwen/Qwen3.5-35B-A3B"): ["Qwen3.5-35B-A3B", "Qwen/Qwen3.5-35B-A3B"],
 }
@@ -2026,13 +2037,75 @@ def _price_http_get(url: str, timeout: int = _PRICE_FETCH_TIMEOUT) -> str:
     return raw.decode("utf-8", errors="replace")
 
 
+def _price_rsc_model_lines(doc: str) -> str:
+    """从 RSC（React Server Components）流式载荷中抽取模型价格行。
+
+    部分供应商（如硅基流动）的定价页由 JS 渲染，模型与价格只存在于 <script>
+    内的 RSC flight 数据里；直接去标签会把这些数据一并丢掉。这里还原 flight
+    段落、展开 $段号 引用，产出「MODEL 名称 | 货币 | 分档价」紧凑行。
+    """
+    try:
+        bs = chr(92)
+        text = doc.replace(bs + '"', '"').replace(bs + "/", "/").replace(bs + "n", chr(10))
+        segments: dict[str, str] = {}
+        for line in text.splitlines():
+            match = re.match(r"^([0-9a-f]{1,4}):(.*)$", line)
+            if match and match.group(1) not in segments:
+                segments[match.group(1)] = match.group(2).strip()
+        if not segments:
+            return ""
+
+        def _expand(value: str, depth: int = 0) -> str:
+            if depth > 3 or "$" not in value:
+                return value
+
+            def _replace(ref) -> str:
+                target = segments.get(ref.group(1))
+                return _expand(target, depth + 1) if target is not None else ref.group(0)
+
+            return re.sub(r"[$]([0-9a-f]{1,4})", _replace, value, count=24)
+
+        rows: list[str] = []
+        for body in segments.values():
+            if "modelName" not in body:
+                continue
+            expanded = _expand(body)
+            name = re.search(r'"modelName":"([^"]+)"', expanded)
+            if not name:
+                continue
+            currency = re.search(r'"currency":"([^"]*)"', expanded)
+            rates = re.findall(
+                r'[{]"price":"([^"]*)","specification":"([^"]*)","unitOfGood":"([^"]*)"[}]',
+                expanded,
+            )
+            if rates:
+                detail = "; ".join(
+                    "%s=%s %s" % (spec, price, unit) for price, spec, unit in rates
+                )
+            else:
+                price = re.search(r'"price":"([^"]*)"', expanded)
+                detail = "price=%s" % (price.group(1) if price else "?")
+            rows.append(
+                "MODEL %s | %s | %s"
+                % (name.group(1), currency.group(1) if currency else "", detail)
+            )
+        return chr(10).join(rows)
+    except Exception:
+        return ""
+
+
 def _price_html_to_text(doc: str) -> str:
     text = re.sub(r"(?is)<script.*?</script>", " ", doc)
     text = re.sub(r"(?is)<style.*?</style>", " ", text)
-    text = re.sub(r"(?s)<[^>]+>", "\n", text)
+    text = re.sub(r"(?s)<[^>]+>", chr(10), text)
     text = html.unescape(text)
     lines = [line.strip() for line in text.splitlines()]
-    return "\n".join(line for line in lines if line)
+    body = chr(10).join(line for line in lines if line)
+
+    embedded = _price_rsc_model_lines(doc)
+    if embedded:
+        return (body + chr(10) + embedded).strip() if body else embedded
+    return body
 
 
 def _price_trim_for_targets(page_text: str, needles: list[str]) -> str:
@@ -2867,6 +2940,276 @@ async def _render_price_card(ctx: Any, prices: dict[str, Any], config: Any = Non
         return None
 
 
+def _band_price_text(band: Optional[dict[str, Any]], currency: str) -> str:
+    """把一个价带压成一行可读文本。"""
+    if not isinstance(band, dict):
+        return "无"
+    hit = float(band.get("cache_hit", 0) or 0)
+    miss = float(band.get("cache_miss", 0) or 0)
+    out = float(band.get("output", 0) or 0)
+    if hit <= 0 and miss <= 0 and out <= 0:
+        return "免费"
+    return "未命中 {:g} / 输出 {:g} {}".format(miss, out, currency)
+
+
+def _band_change(old_band: Optional[dict[str, Any]], new_band: Optional[dict[str, Any]]) -> tuple[str, Optional[float]]:
+    """判断一个价带的变化方向与幅度（百分数）。"""
+    if not isinstance(old_band, dict):
+        return "新增", None
+    if not isinstance(new_band, dict):
+        return "移除", None
+    old_miss = float(old_band.get("cache_miss", 0) or 0)
+    new_miss = float(new_band.get("cache_miss", 0) or 0)
+    if old_miss != new_miss:
+        old_base, new_base = old_miss, new_miss
+    else:
+        old_base = float(old_band.get("output", 0) or 0)
+        new_base = float(new_band.get("output", 0) or 0)
+    if old_base == new_base:
+        return "持平", 0.0
+    if old_base <= 0:
+        return "增长", None
+    percent = (new_base - old_base) / old_base * 100.0
+    return ("增长" if percent > 0 else "下降"), abs(percent)
+
+
+def _price_display_alias(provider: str, model: str) -> str:
+    """给模型挑一个群友更容易认的短名。"""
+    for hint in DEFAULT_MODEL_ALIASES.get((provider, model)) or []:
+        text = str(hint or "").strip()
+        if text and text != model and "/" not in text:
+            return text
+    return model.split("/")[-1] if "/" in model else model
+
+
+def _price_change_entries(previous: dict[str, Any], current: dict[str, Any]) -> list[dict[str, Any]]:
+    """对比前后两份价目表，产出逐模型逐价带的可读变更条目。"""
+    entries: list[dict[str, Any]] = []
+    for key in sorted(set(previous.keys()) | set(current.keys())):
+        old_raw = previous.get(key)
+        new_raw = current.get(key)
+        old_entry = old_raw if isinstance(old_raw, dict) else None
+        new_entry = new_raw if isinstance(new_raw, dict) else None
+        if old_entry is None and new_entry is None:
+            continue
+        provider, model = _split_price_key(key)
+        merged = new_entry or old_entry or {}
+        currency = str(merged.get("currency") or "CNY")
+        tiers = merged.get("tiers") or None
+        old_bands = [b for b in ((old_entry or {}).get("bands") or []) if isinstance(b, dict)]
+        new_bands = [b for b in ((new_entry or {}).get("bands") or []) if isinstance(b, dict)]
+        rows: list[dict[str, Any]] = []
+        for index, new_band in enumerate(new_bands):
+            old_band = old_bands[index] if index < len(old_bands) else None
+            direction, percent = _band_change(old_band, new_band)
+            if direction == "持平":
+                continue
+            rows.append(
+                {
+                    "when": _describe_band_when(new_band, tiers),
+                    "direction": direction,
+                    "percent": percent,
+                    "old": _band_price_text(old_band, currency) if old_band is not None else "",
+                    "new": _band_price_text(new_band, currency),
+                }
+            )
+        for index in range(len(new_bands), len(old_bands)):
+            old_band = old_bands[index]
+            rows.append(
+                {
+                    "when": _describe_band_when(old_band, tiers),
+                    "direction": "移除",
+                    "percent": None,
+                    "old": _band_price_text(old_band, currency),
+                    "new": "",
+                }
+            )
+        if not rows:
+            continue
+        alias = _price_display_alias(provider, model)
+        entries.append(
+            {
+                "provider": provider,
+                "model": model,
+                "alias": "" if alias == model else alias,
+                "rows": rows,
+            }
+        )
+    return entries
+
+
+def _price_unchanged_models(previous: dict[str, Any], current: dict[str, Any]) -> list[str]:
+    """找出两边都有、且价格完全没变的模型（用于说明覆盖范围）。"""
+    names: list[str] = []
+    for key in sorted(set(previous.keys()) & set(current.keys())):
+        old_entry = previous.get(key)
+        new_entry = current.get(key)
+        if not isinstance(old_entry, dict) or not isinstance(new_entry, dict):
+            continue
+        old_bands = [b for b in (old_entry.get("bands") or []) if isinstance(b, dict)]
+        new_bands = [b for b in (new_entry.get("bands") or []) if isinstance(b, dict)]
+        if not old_bands or len(old_bands) != len(new_bands):
+            continue
+        if all(_band_change(old_band, new_band)[0] == "持平" for old_band, new_band in zip(old_bands, new_bands)):
+            _, model = _split_price_key(key)
+            names.append(model)
+    return names
+
+
+def _describe_price_change(previous: dict[str, Any], current: dict[str, Any], headline: str) -> str:
+    """文本版变更明细；图渲染不可用时直接发它。"""
+    entries = _price_change_entries(previous, current)
+    lines = [headline]
+    if not entries:
+        lines.append("没有可展示的明细。")
+    for entry in entries:
+        lines.append("")
+        lines.append("{}  {}".format(entry["model"], entry["alias"]).strip())
+        for row in entry["rows"]:
+            if row["direction"] == "新增":
+                lines.append("  {}  {}：{}".format(row["when"], row["direction"], row["new"]))
+            elif row["direction"] == "移除":
+                lines.append("  {}  已移除（原 {}）".format(row["when"], row["old"]))
+            else:
+                percent = row["percent"]
+                tail = "{} {}".format(row["direction"], "{:.1f}%".format(percent) if percent is not None else "")
+                lines.append("  {}  {} -> {}，{}".format(row["when"], row["old"], row["new"], tail.strip()))
+    unchanged = _price_unchanged_models(previous, current)
+    if unchanged:
+        lines.append("")
+        lines.append("价格未变（{} 个）：{}".format(len(unchanged), "、".join(unchanged)))
+    lines.append("")
+    lines.append("已挂起，回复 /价格确认 应用，/价格否决 丢弃。")
+    return chr(10).join(lines)
+
+
+_PRICE_CHANGE_EXTRA_CSS = """
+.band-price em { font-style: normal; font-weight: 700; }
+.band-price em.up { color: #c0392b; }
+.band-price em.down { color: #0f766e; }
+.band-price em.add { color: #0f766e; }
+.band-price em.del { color: #c0392b; }
+.band-price .arrow { color: #98a4a6; font-weight: 400; }
+"""
+
+
+def _price_change_band_html(row: dict[str, Any]) -> str:
+    """把一条变更渲染成价带行。"""
+    if row["direction"] == "新增":
+        price = '<em class="add">新增</em> {}'.format(html.escape(row["new"]))
+    elif row["direction"] == "移除":
+        price = '<em class="del">移除</em> 原 {}'.format(html.escape(row["old"]))
+    else:
+        cls = "up" if row["direction"] == "增长" else "down"
+        percent = "{:.1f}%".format(row["percent"]) if row["percent"] is not None else ""
+        price = '{} <span class="arrow">-&gt;</span> {}，<em class="{}">{} {}</em>'.format(
+            html.escape(row["old"]),
+            html.escape(row["new"]),
+            cls,
+            html.escape(row["direction"]),
+            percent,
+        )
+    return '<div class="band"><div class="band-when">{}</div><div class="band-price">{}</div></div>'.format(
+        html.escape(row["when"]), price
+    )
+
+
+def _build_price_change_html(previous: dict[str, Any], current: dict[str, Any], headline: str) -> str:
+    """把牌价变更渲染成一张卡片 HTML。"""
+    entries = _price_change_entries(previous, current)
+    rows_html: list[str] = []
+    band_count = 0
+    for entry in entries:
+        band_count += len(entry["rows"])
+        rows_html.append(
+            '<div class="row"><div class="row-top"><div class="model">{}</div>'
+            '<div class="badge">{}</div></div>{}</div>'.format(
+                html.escape(entry["model"]),
+                html.escape(entry["alias"]),
+                "".join(_price_change_band_html(row) for row in entry["rows"]),
+            )
+        )
+    body_rows = chr(10).join(rows_html) if rows_html else '<div class="row">本次没有需要展示的变更明细。</div>'
+    unchanged = _price_unchanged_models(previous, current)
+    unchanged_html = (
+        "价格未变（{} 个）：{}<br>".format(len(unchanged), html.escape("、".join(unchanged)))
+        if unchanged
+        else ""
+    )
+    generated = _now_text()
+    return """<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<style>{css}</style>
+</head>
+<body>
+<main class="sheet">
+  <section class="head">
+    <div class="kicker">{generated}</div>
+    <h1>牌价变更待确认</h1>
+    <div class="subtitle">{headline}</div>
+  </section>
+  <section class="metrics">
+    <div class="metric"><div class="label">涉及模型</div><div class="value">{model_count}</div></div>
+    <div class="metric"><div class="label">变更价带</div><div class="value">{band_count}</div></div>
+    <div class="metric"><div class="label">回应用法</div><div class="value" style="font-size:24px">/价格确认</div></div>
+  </section>
+  <div class="section-title">逐项对比</div>
+  {rows}
+  <div class="footer">{unchanged}回复 /价格确认 应用，/价格否决 丢弃。</div>
+</main>
+</body>
+</html>""".format(
+        css=_PRICE_CARD_CSS + _PRICE_CHANGE_EXTRA_CSS,
+        generated=html.escape(generated),
+        headline=html.escape(headline),
+        model_count=len(entries),
+        band_count=band_count,
+        rows=body_rows,
+        unchanged=unchanged_html,
+    )
+
+
+async def _render_price_change_card(ctx: Any, previous: dict[str, Any], current: dict[str, Any], headline: str) -> Any:
+    """把牌价变更渲染成图片；渲染不可用时返回 None，由调用方退回文字。"""
+    try:
+        html_doc = _build_price_change_html(previous, current, headline)
+    except Exception:
+        return None
+    renderer = _get_path(ctx, "render")
+    html2png = getattr(renderer, "html2png", None)
+    if not callable(html2png):
+        return None
+    try:
+        return await _maybe_await(
+            html2png(
+                html_doc,
+                selector="body",
+                viewport={"width": 900, "height": 480},
+                device_scale_factor=1.0,
+                full_page=True,
+            )
+        )
+    except TypeError:
+        try:
+            return await _maybe_await(html2png(html_doc))
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+
+async def _send_image_response(ctx: Any, image: Any, stream_id: str) -> bool:
+    """把渲染结果当图片发出去；拿不到图片数据时返回 False。"""
+    content = _extract_image_base64(image)
+    if not content or not stream_id:
+        return False
+    sender = _get_path(ctx, "send")
+    if sender is None:
+        return False
+    return await _send_image_segment(sender, content, stream_id)
+
 def _describe_prices(prices: Optional[dict[str, Any]] = None) -> str:
     prices = prices if isinstance(prices, dict) else _load_prices()
     active = prices.get("active") or {}
@@ -2907,7 +3250,8 @@ def _describe_prices(prices: Optional[dict[str, Any]] = None) -> str:
     return "\n".join(lines)
 
 
-async def _notify_admins(ctx: Any, config: Any, text: str) -> None:
+async def _notify_admins(ctx: Any, config: Any, text: str, image: Any = None) -> None:
+    """给管理员发变更通知：优先图片，发不出图片时退回文字。"""
     admins = _config_list(getattr(getattr(config, "permission", None), "admins", None))
     if not admins:
         _log(ctx, "warning", f"价格变更需要确认，但没有配置管理员，消息未发出：{text}")
@@ -2915,7 +3259,12 @@ async def _notify_admins(ctx: Any, config: Any, text: str) -> None:
     for admin_id in admins[:3]:
         try:
             stream_id = await _resolve_target_stream_id(ctx, "private", admin_id)
-            if stream_id:
+            if not stream_id:
+                continue
+            sent = False
+            if image is not None:
+                sent = await _send_image_response(ctx, image, stream_id)
+            if not sent:
                 await _send_command_response(ctx, text, stream_id)
         except Exception:
             continue
@@ -2986,7 +3335,17 @@ async def _refresh_prices(ctx: Any, config: Any) -> dict[str, Any]:
 
     prices = _load_prices()
     previous_models = _active_price_models(prices)
-    new_models: dict[str, Any] = dict(previous_models)
+    # 只继承本回仍在抓取目标里的旧模型；已从配置里删掉、或超出用量窗口的会自然滑出
+    target_pairs = {
+        (provider, model)
+        for provider, models in targets_by_provider.items()
+        for model in models
+    }
+    new_models: dict[str, Any] = {
+        key: value
+        for key, value in previous_models.items()
+        if _split_price_key(key) in target_pairs
+    }
     source_report: dict[str, Any] = {}
 
     for provider, models in targets_by_provider.items():
@@ -3049,29 +3408,28 @@ async def _refresh_prices(ctx: Any, config: Any) -> dict[str, Any]:
     if need_confirm:
         prices["pending"] = document
         _save_prices(prices)
-        if structural:
-            detail = "；".join(structural[:5])
-        elif changes:
-            detail = "；".join(changes[:5])
-        else:
-            detail = "无明细"
         if not previous_models:
-            headline = "首次生成官方牌价表，已挂起等待确认（无基准可比，按巨变处理）。"
+            headline = "首次生成官方牌价表，无基准可比，按巨变处理。"
+        elif structural and max_percent <= threshold:
+            headline = "牌价表出现 {} 项结构性变化（新增/移除模型）。".format(len(structural))
         else:
-            headline = "牌价表出现较大变动，已挂起等待确认。变化幅度 {:.1f}%（阈值 {:.0f}%）".format(
+            headline = "牌价表变化幅度 {:.1f}%（阈值 {:.0f}%）".format(
                 max_percent, threshold
             )
-        await _notify_admins(
-            ctx,
-            config,
-            "{}\n{}\n回复 /价格确认 应用，/价格否决 丢弃。".format(headline, detail),
-        )
+        change_text = _describe_price_change(previous_models, new_models, headline)
+        change_image = await _render_price_change_card(ctx, previous_models, new_models, headline)
+        await _notify_admins(ctx, config, change_text, image=change_image)
         _log(ctx, "warning", f"牌价表已挂起等待确认：{headline}")
         return {
             "applied": False,
             "pending": True,
             "change_percent": round(max_percent, 2),
-            "reason": "变化超阈值，等待管理员确认",
+            "structural_count": len(structural),
+            "reason": (
+                "出现结构性变化（新增/移除模型），等待管理员确认"
+                if structural and max_percent <= threshold
+                else "变化超阈值，等待管理员确认"
+            ),
         }
 
     document["applied_at"] = _now_text()

@@ -3,3 +3,4 @@ __pycache__/
 data/
 exchange_rate.json
 /config.toml
+*.bak*
