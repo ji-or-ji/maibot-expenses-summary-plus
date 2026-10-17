@@ -688,6 +688,25 @@ class ExpensesSummaryPlugin(MaiBotPlugin):
         else:
             response = f"本次未更新：{result.get('reason', '未知原因')}"
         await _send_command_response(self.ctx, response, target_stream_id)
+        if result.get("applied"):
+            try:
+                prices_now = _load_prices()
+                image = await _render_price_card(self.ctx, prices_now, config)
+                if _extract_image_base64(image):
+                    nickname = (
+                        (config.report.nickname or "").strip()
+                        or (await _resolve_bot_nickname(self.ctx))
+                        or "麦麦"
+                    )
+                    nodes = [
+                        _make_forward_node(
+                            "text", "官方牌价表（发 /价格刷新 可立即更新）", nickname=nickname
+                        ),
+                        _image_node(image, nickname=nickname),
+                    ]
+                    await _send_forward(self.ctx, nodes, target_stream_id)
+            except Exception as exc:
+                _log(self.ctx, "warning", f"牌价表卡片发送失败: {exc}")
         return True, response, True
 
     @Command(

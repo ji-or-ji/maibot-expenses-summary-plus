@@ -309,6 +309,11 @@ sources = []
 
 ## 更新日志
 
+### 2.0.8
+
+- `/价格刷新` 成功应用新牌价后，除文字回报外，再发一张**价目表卡片**（与 `/价格` 同款）。
+- 卡片发送失败不影响刷新结果，只记 warning。
+
 ### 2.0.7
 
 - 新增**计费口径指纹**：记录 `mode / currency / renew_amount / renew_day / share_daily / exchange_rate`。
