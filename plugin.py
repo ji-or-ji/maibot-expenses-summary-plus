@@ -666,7 +666,7 @@ class ExpensesSummaryPlugin(MaiBotPlugin):
         except Exception as exc:
             result = {"applied": False, "reason": f"抓取异常: {exc}"}
         if result.get("applied"):
-            response = "牌价表已更新：v{}，{models} 个模型，本次变化 {change_percent}%".format(
+            response = "牌价表已更新：v{}，{} 个模型，本次变化 {}%".format(
                 result.get("version"), result.get("models"), result.get("change_percent")
             )
             if result.get("rebuild"):
@@ -3274,7 +3274,7 @@ def _describe_prices(prices: Optional[dict[str, Any]] = None) -> str:
         bands = entry.get("bands") or []
         head = bands[0] if bands else {}
         lines.append(
-            "· {} / {}：命中 {g} / 未命中 {g} / 输出 {g} {}（{d} 个价带）".format(
+            "· {} / {}：命中 {:g} / 未命中 {:g} / 输出 {:g} {}（{} 个价带）".format(
                 provider,
                 model,
                 head.get("cache_hit", 0),
