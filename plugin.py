@@ -1921,8 +1921,8 @@ PRICING_HISTORY_LIMIT = 20
 
 DEFAULT_PRICE_SOURCES: dict[str, dict[str, str]] = {
     "DeepSeek": {
-        "label": "DeepSeek 官方",
-        "url": "https://api-docs.deepseek.com/quick_start/pricing",
+        "label": "DeepSeek 官方（中文页，人民币计价）",
+        "url": "https://api-docs.deepseek.com/zh-cn/quick_start/pricing",
     },
     "SiliconFlow": {
         "label": "硅基流动",

@@ -309,6 +309,12 @@ sources = []
 
 ## 更新日志
 
+### 2.0.3
+
+- DeepSeek 默认抓取源改为**中文价目页**（`zh-cn/quick_start/pricing`），抓回来直接是人民币价，
+  不再需要手动把 `prices.json` 改成 CNY，也不会再出现 USD 与 CNY 混比。
+- 若你的部署环境需要英文页或其它镜像，可在 `[pricing].sources` 里用 `供应商=地址` 覆盖。
+
 ### 2.0.2
 
 - 修复牌价比对闸门的**币种混比**：`_flatten_price_points` 现在会先把 USD 条目按当前汇率折算为人民币，
