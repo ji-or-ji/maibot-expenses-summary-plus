@@ -3329,14 +3329,39 @@ async def _notify_admins(ctx: Any, config: Any, text: str, image: Any = None) ->
             continue
 
 
+def _billing_fingerprint(billing: Any) -> dict[str, Any]:
+    """订阅/混合计费口径的指纹，用于检测币种或金额变化。"""
+    if billing is None:
+        return {}
+    return {
+        "mode": str(getattr(billing, "mode", "") or "").strip().lower(),
+        "currency": str(getattr(billing, "currency", "") or "").strip().lower(),
+        "renew_amount": round(float(getattr(billing, "renew_amount", 0) or 0), 6),
+        "renew_day": int(getattr(billing, "renew_day", 0) or 0),
+        "share_daily": bool(getattr(billing, "share_daily", True)),
+        "exchange_rate": round(float(getattr(billing, "exchange_rate", 0) or 0), 6),
+    }
+
+
 def _maybe_rebuild_ledger(ctx: Any, config: Any, models: Any, force: bool = False) -> str:
     """按官方牌价重建账本历史开销。默认只做一次；force=True 时忽略标记强制重算。"""
     pricing = getattr(config, "pricing", None)
     if not bool(getattr(pricing, "rebuild_ledger", False)):
         return ""
+    billing = getattr(config, "billing", None)
+    snapshot = _billing_fingerprint(billing)
     prices = _load_prices()
+    previous_snapshot = prices.get("billing_snapshot") or {}
+    billing_changed = bool(previous_snapshot) and bool(snapshot) and previous_snapshot != snapshot
+    if billing_changed:
+        force = True
+        changed_keys = [key for key in snapshot if previous_snapshot.get(key) != snapshot.get(key)]
+        _log(ctx, "info", "检测到计费口径变化，将重算账本：" + ", ".join(changed_keys))
     marker = prices.get("ledger_rebuild") or {}
     if not force and marker.get("done") and int(marker.get("version") or 0) >= _REBUILD_VERSION:
+        if snapshot and snapshot != previous_snapshot:
+            prices["billing_snapshot"] = snapshot
+            _save_prices(prices)
         return ""
     db_path = _resolve_db_path()
     if db_path is None:
@@ -3355,6 +3380,8 @@ def _maybe_rebuild_ledger(ctx: Any, config: Any, models: Any, force: bool = Fals
         "to": rebuilt["to"],
         "days": rebuilt["days"],
     }
+    if snapshot:
+        prices["billing_snapshot"] = snapshot
     _save_prices(prices)
     note = f"账本已按官方牌价重算：{rebuilt['from']} ~ {rebuilt['to']}，共 {rebuilt['days']} 天。"
     _log(ctx, "info", note)
