@@ -2332,8 +2332,50 @@ def _price_document(
 # ---------------------------------------------------------------------------
 
 
+def _band_hour_in_shanghai(tz_name: str, hour: int) -> int:
+    """把某个时区的小时换算到 Asia/Shanghai，用于价带签名归一化。"""
+    try:
+        source = ZoneInfo(tz_name)
+    except Exception:
+        source = None
+    target = None
+    if ZoneInfo is not None:
+        try:
+            target = ZoneInfo("Asia/Shanghai")
+        except Exception:
+            target = None
+    if source is None or target is None:
+        # 没有 tzdata 时至少处理最常用的 UTC 偏移。
+        if tz_name.upper() in ("UTC", "ETC/UTC"):
+            return (hour + 8) % 24
+        return hour
+    try:
+        base = datetime(2026, 1, 5, hour % 24, 0, tzinfo=source)
+        return base.astimezone(target).hour
+    except Exception:
+        return hour
+
+
+def _band_signature(band: dict[str, Any]) -> str:
+    """生成与 tz 表达无关的价带签名（统一换算到上海时区）。"""
+    tz_name = str(band.get("tz") or "Asia/Shanghai")
+    hours = band.get("hours")
+    weekdays = band.get("weekdays")
+    tier = int(band.get("tier", 0) or 0)
+    if not hours:
+        return "all|{}|{}".format(weekdays, tier)
+    converted: list[tuple[int, int]] = []
+    for item in hours:
+        try:
+            h0, h1 = int(item[0]), int(item[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        converted.append((_band_hour_in_shanghai(tz_name, h0), _band_hour_in_shanghai(tz_name, h1)))
+    return "{}|{}|{}".format(sorted(converted), weekdays, tier)
+
+
 def _flatten_price_points(models: Any, usd_rate: float = 0.0) -> dict[str, tuple[float, float, float]]:
-    """将价格表展平为统一人民币口径，避免 USD 与 CNY 直接比较。"""
+    """将价格表展平为统一口径：汇率归一化 + 价带时间归一化。"""
     flat: dict[str, tuple[float, float, float]] = {}
     if not isinstance(models, dict):
         return flat
@@ -2346,10 +2388,7 @@ def _flatten_price_points(models: Any, usd_rate: float = 0.0) -> dict[str, tuple
         for band in entry.get("bands") or []:
             if not isinstance(band, dict):
                 continue
-            signature = "{}|{}|{}|{}".format(
-                band.get("tz"), band.get("hours"), band.get("weekdays"), band.get("tier", 0)
-            )
-            flat[f"{key}#{signature}"] = (
+            flat[f"{key}#{_band_signature(band)}"] = (
                 float(band.get("cache_hit", 0) or 0) * rate,
                 float(band.get("cache_miss", 0) or 0) * rate,
                 float(band.get("output", 0) or 0) * rate,
