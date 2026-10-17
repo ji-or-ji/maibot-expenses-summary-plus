@@ -2408,6 +2408,20 @@ def _compare_price_tables(
     for key in sorted(set(new_flat) - set(old_flat)):
         structural.append(f"新增 {key}")
     max_percent = 0.0
+    currency_changes: list[str] = []
+    if isinstance(old_models, dict) and isinstance(new_models, dict):
+        for key in sorted(set(old_models) & set(new_models)):
+            old_entry = old_models.get(key) or {}
+            new_entry = new_models.get(key) or {}
+            if not isinstance(old_entry, dict) or not isinstance(new_entry, dict):
+                continue
+            old_currency = str(old_entry.get("currency", "CNY") or "CNY").upper()
+            new_currency = str(new_entry.get("currency", "CNY") or "CNY").upper()
+            if old_currency != new_currency:
+                currency_changes.append(
+                    f"{key} 币种 {old_currency} → {new_currency}（已按汇率折算比较）"
+                )
+    changes = currency_changes + changes
     for key in sorted(set(old_flat) & set(new_flat)):
         for label, before, after in zip(
             ("缓存命中", "缓存未命中", "输出"), old_flat[key], new_flat[key]
