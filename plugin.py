@@ -2332,13 +2332,17 @@ def _price_document(
 # ---------------------------------------------------------------------------
 
 
-def _flatten_price_points(models: Any) -> dict[str, tuple[float, float, float]]:
+def _flatten_price_points(models: Any, usd_rate: float = 0.0) -> dict[str, tuple[float, float, float]]:
+    """将价格表展平为统一人民币口径，避免 USD 与 CNY 直接比较。"""
     flat: dict[str, tuple[float, float, float]] = {}
     if not isinstance(models, dict):
         return flat
+    rate_default = usd_rate if usd_rate > 0 else 7.2
     for key, entry in models.items():
         if not isinstance(entry, dict):
             continue
+        currency = str(entry.get("currency", "CNY") or "CNY").upper()
+        rate = rate_default if currency == "USD" else 1.0
         for band in entry.get("bands") or []:
             if not isinstance(band, dict):
                 continue
@@ -2346,16 +2350,18 @@ def _flatten_price_points(models: Any) -> dict[str, tuple[float, float, float]]:
                 band.get("tz"), band.get("hours"), band.get("weekdays"), band.get("tier", 0)
             )
             flat[f"{key}#{signature}"] = (
-                float(band.get("cache_hit", 0) or 0),
-                float(band.get("cache_miss", 0) or 0),
-                float(band.get("output", 0) or 0),
+                float(band.get("cache_hit", 0) or 0) * rate,
+                float(band.get("cache_miss", 0) or 0) * rate,
+                float(band.get("output", 0) or 0) * rate,
             )
     return flat
 
 
-def _compare_price_tables(old_models: Any, new_models: Any) -> tuple[float, list[str], list[str]]:
-    old_flat = _flatten_price_points(old_models)
-    new_flat = _flatten_price_points(new_models)
+def _compare_price_tables(
+    old_models: Any, new_models: Any, usd_rate: float = 0.0
+) -> tuple[float, list[str], list[str]]:
+    old_flat = _flatten_price_points(old_models, usd_rate)
+    new_flat = _flatten_price_points(new_models, usd_rate)
     structural: list[str] = []
     changes: list[str] = []
     for key in sorted(set(old_flat) - set(new_flat)):
@@ -3395,7 +3401,9 @@ async def _refresh_prices(ctx: Any, config: Any) -> dict[str, Any]:
         return {"applied": False, "reason": "本次没有解析出任何可用价格"}
     _log(ctx, "info", f"牌价解析完成，共 {len(new_models)} 个模型条目")
 
-    max_percent, structural, changes = _compare_price_tables(previous_models, new_models)
+    billing = getattr(config, "billing", None)
+    usd_rate = _get_exchange_rate(billing) if billing is not None else 0.0
+    max_percent, structural, changes = _compare_price_tables(previous_models, new_models, usd_rate)
     document = _price_document(
         new_models,
         source_report,
