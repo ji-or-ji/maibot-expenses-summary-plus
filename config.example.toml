@@ -2,7 +2,7 @@
 config_version = "2.0.0"
 
 [report]
-mode = "maichenfeng"
+mode = "default"
 title = "今日模型调用财报"
 llm_task = "utils"
 use_forward_message = true
@@ -15,10 +15,10 @@ commands_hint = ""
 
 [permission]
 query_admin_only = false
-admins = ["***REDACTED***"]
+admins = []
 
 [scheduler]
-enabled = true
+enabled = false
 time = "23:30"
 group_ids = []
 private_ids = []

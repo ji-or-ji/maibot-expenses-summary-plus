@@ -296,8 +296,12 @@ sources = []
 
 ## 兼容性
 
-- MaiBot 最低版本：`1.0.9`
-- SDK 版本：`2.6`
+实测环境（manifest 声明范围据此填写，未验证的版本不虚标）：
+
+- **MaiBot 宿主**：1.2.3 实测通过；声明范围 `1.2.0 ~ 1.2.99`。
+- **maibot-plugin-sdk**：2.8.0 实测通过；声明范围 `2.6.0 ~ 2.8.99`。
+
+超出声明范围（如宿主 2.x、SDK 2.9+）未经实测，不保证可用。
 
 插件使用 `ctx.statistics.local.*` 获取统计数据，使用 `ctx.render.html2png()` 生成图片。合并转发模式使用 `ctx.send.forward()`，普通消息模式使用 `ctx.send.text()` 和 `ctx.send.image()`。
 
@@ -307,7 +311,23 @@ sources = []
 数据库路径由插件数据目录向上推算（`<MaiBot>/data/MaiBot.db`），只读打开（`mode=ro` + `PRAGMA query_only`），不写入。
 `statistics_model_hourly` 表缺备份字段，无法用于缓存分化计价，故不走它。
 
+> **关于宿主私有表**：`llm_usage` 不是插件 API 承诺的公开接口。插件依赖的列为
+> `timestamp / model_name / model_api_provider_name / prompt_tokens /
+> prompt_cache_hit_tokens / prompt_cache_miss_tokens / completion_tokens / cost`。
+> 启动查询前会先 `PRAGMA table_info(llm_usage)` 校验这些列；**任一列缺失即放弃按量成本、回退到原生 cost**，不会因宿主改表而崩溃。
+> 宿主升级若改动该表结构，请告知作者更新适配。
+
+> **价格源覆盖**：`pricing.sources` 仅接受管理员配置，且只放行 `https` + 公网主机；
+> `localhost`、内网段（10/172.16-31/192.168）、链路本地（169.254，含云元数据）、保留地址与 `.local` / `.internal` 域名会被忽略，保留内置源。
+
 ## 更新日志
+
+### 2.0.9
+
+- **兼容性声明改为实测范围**：宿主 `1.2.0 ~ 1.2.99`（实测 1.2.3）、SDK `2.6.0 ~ 2.8.99`（实测 2.8.0），不再使用 `1.99.99 / 2.99.99` 占位上限。
+- **价格源覆盖加安全校验**：`pricing.sources` 只接受 `https` + 公网主机，拒绝 localhost、内网段、链路本地（含云元数据）与保留地址。
+- **宿主私有表防御**：查询 `llm_usage` 前校验依赖列是否存在，缺列时优雅回退，不因宿主改表而崩溃。
+- manifest 增加 `plugin_type = "utility"`；`config.example.toml` 的 `report.mode`、`scheduler.enabled`、`permission.admins` 与代码默认值对齐，并移除示例中的个人 QQ。
 
 ### 2.0.8
 

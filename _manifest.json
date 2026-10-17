@@ -2,7 +2,7 @@
   "manifest_version": 2,
   "id": "fulawa.maibot-expenses-summary-plus",
   "name": "麦麦财务总结优化",
-  "version": "2.0.8",
+  "version": "2.0.9",
   "description": "统计当天模型调用次数和花费，支持按量/订阅/混合三种计费口径（续费日周期、自动汇率），以默认或麦晨风模式生成转发消息财报。v2.0 起改为定时抓取官方价格页、按缓存命中/未命中/输出三分与峰谷时段计价，支持超阈值挂起与管理员确认，并可用真实牌价重建账本。v2.0.2 起比价前先按币种归一化，避免 USD/CNY 混比造成误报。v2.0.8 让 /价格刷新 成功后也发一张价目表卡片。",
   "author": {
     "name": "fulawa",
@@ -16,14 +16,15 @@
     "issues": "https://github.com/ji-or-ji/maibot-expenses-summary-plus/issues"
   },
   "host_application": {
-    "min_version": "1.0.0",
-    "max_version": "1.99.99"
+    "min_version": "1.2.0",
+    "max_version": "1.2.99"
   },
   "sdk": {
     "min_version": "2.6.0",
-    "max_version": "2.99.99"
+    "max_version": "2.8.99"
   },
   "dependencies": [],
+  "plugin_type": "utility",
   "capabilities": [
     "send.forward",
     "send.text",

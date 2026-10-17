@@ -12,11 +12,13 @@ import asyncio
 import base64
 import calendar
 import html
+import ipaddress
 import json
 import random
 import re
 import shutil
 import sqlite3
+import urllib.parse
 import urllib.request
 
 try:
@@ -2022,6 +2024,33 @@ def _active_price_models(prices: Optional[dict[str, Any]] = None) -> dict[str, A
     return models if isinstance(models, dict) else {}
 
 
+def _is_allowed_price_source_url(url: str) -> bool:
+    """仅允许 https + 公网主机，拒绝本机、内网与保留地址。"""
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except Exception:
+        return False
+    if parsed.scheme != "https":
+        return False
+    host = (parsed.hostname or "").strip().lower()
+    if not host:
+        return False
+    if host in ("localhost", "localhost.localdomain") or host.endswith(".local") or host.endswith(".internal"):
+        return False
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return True
+    return not (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_multicast
+        or ip.is_unspecified
+    )
+
+
 def _price_source_map(config: Any = None) -> dict[str, dict[str, str]]:
     """内置价格源 + 配置覆盖（配置格式：供应商=页面地址）。"""
     sources = {name: dict(meta) for name, meta in DEFAULT_PRICE_SOURCES.items()}
@@ -2030,6 +2059,9 @@ def _price_source_map(config: Any = None) -> dict[str, dict[str, str]]:
         name, _, url = str(item).partition("=")
         name, url = name.strip(), url.strip()
         if not name or not url:
+            continue
+        if not _is_allowed_price_source_url(url):
+            # 跳过非 https 或指向本机/内网/保留地址的覆盖项，保留内置源
             continue
         sources.setdefault(name, {"label": name})
         sources[name]["url"] = url
@@ -2479,6 +2511,27 @@ def _resolve_db_path() -> Optional[Path]:
     return None
 
 
+_USAGE_REQUIRED_COLUMNS = (
+    "timestamp",
+    "model_name",
+    "model_api_provider_name",
+    "prompt_tokens",
+    "prompt_cache_hit_tokens",
+    "prompt_cache_miss_tokens",
+    "completion_tokens",
+    "cost",
+)
+
+
+def _usage_schema_ok(connection: Any) -> bool:
+    """校验宿主 llm_usage 表是否包含本插件依赖的列，缺列时优雅降级。"""
+    try:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(llm_usage)").fetchall()}
+    except Exception:
+        return False
+    return all(name in columns for name in _USAGE_REQUIRED_COLUMNS)
+
+
 def _open_usage_db(db_path: Path) -> Any:
     uri = "file:///" + db_path.as_posix().lstrip("/")
     connection = sqlite3.connect(uri, uri=True, timeout=10)
@@ -2523,6 +2576,12 @@ def _query_usage(db_path: Path, start_text: str, end_text: str, models: Any) -> 
         connection = _open_usage_db(db_path)
     except Exception:
         return None
+    if not _usage_schema_ok(connection):
+        try:
+            connection.close()
+        except Exception:
+            pass
+        return None
     try:
         cursor = connection.execute(sql, (*tier_params, start_text, end_text))
         columns = [item[0] for item in cursor.description]
@@ -2547,6 +2606,12 @@ def _query_target_models(db_path: Path, days: int = _PRICE_TARGET_LOOKBACK_DAYS)
     try:
         connection = _open_usage_db(db_path)
     except Exception:
+        return None
+    if not _usage_schema_ok(connection):
+        try:
+            connection.close()
+        except Exception:
+            pass
         return None
     try:
         cursor = connection.execute(sql, (start_text,))
