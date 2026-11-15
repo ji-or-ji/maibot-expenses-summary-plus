@@ -18,6 +18,7 @@ import random
 import re
 import shutil
 import sqlite3
+import time
 import urllib.parse
 import urllib.request
 
@@ -232,6 +233,24 @@ class PricingConfig(PluginConfigBase):
         default=[],
         title="价格源覆盖",
         description="格式 供应商=页面地址，可覆盖内置默认源；留空用内置",
+    )
+    holiday_aware: bool = Field(
+        default=True,
+        title="识别法定节假日与调休",
+        description=(
+            "按中国法定节假日调整峰谷时段：节假日全天不计高峰，调休补班的周末按工作日计。"
+            "取不到日历时自动退回纯星期判断，不阻塞计费"
+        ),
+    )
+    holiday_source: str = Field(
+        default="https://api.apihubs.cn/holiday/get?year={year}&size=400",
+        title="节假日数据源",
+        description="需含 {year} 占位符，返回全年每日 workday 标记（含调休补班）",
+    )
+    holiday_fallback_source: str = Field(
+        default="https://date.nager.at/api/v3/PublicHolidays/{year}/CN",
+        title="节假日备用源",
+        description="主源失败时使用；只含法定节日当天，不含调休，仅作兑底",
     )
 
 
@@ -566,6 +585,12 @@ class ExpensesSummaryPlugin(MaiBotPlugin):
 
     async def _pricing_loop(self) -> None:
         """首次没有生效牌价时先抓一次，之后每天在 refresh_time 抓。"""
+        try:
+            years = await asyncio.to_thread(_ensure_holiday_calendar, self._get_config())
+            if years:
+                _log(self.ctx, "info", "节假日日历已就绪: " + "、".join(str(y) for y in years))
+        except Exception as exc:
+            _log(self.ctx, "warning", f"节假日日历初始化失败，峰谷判定退回纯星期口径: {exc}")
         try:
             if not _active_price_models():
                 _log(self.ctx, "info", "未找到生效牌价，20 秒后执行首次抓取")
@@ -2664,6 +2689,187 @@ def _band_local_parts(dt_naive: datetime, tz_name: str) -> tuple[int, int]:
     return converted.weekday(), converted.hour
 
 
+# ---------------------------------------------------------------------------
+# 中国法定节假日与调休
+#
+# 官方牌价里的「高峰时段」只算工作日：周一至周五 9:00-12:00 / 14:00-18:00，
+# 且不含中国法定节假日。只看 weekday 会把春节、国庆这种长假的白天按高峰计价，
+# 反之调休补班的周末本该算高峰却被当成空闲。这里按年拉一份官方放假日历。
+# ---------------------------------------------------------------------------
+
+_HOLIDAY_CACHE_FILENAME = "holidays.json"
+_HOLIDAY_SCHEMA = 1
+_HOLIDAY_REFRESH_DAYS = 7
+_HOLIDAY_REQUEST_GAP = 5.0
+_HOLIDAY_MEMO: dict[int, dict[str, Any]] = {}
+
+
+def _holiday_cache_path() -> Path:
+    path = _data_dir() / _HOLIDAY_CACHE_FILENAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _load_holidays() -> dict[str, Any]:
+    empty = {"schema": _HOLIDAY_SCHEMA, "years": {}}
+    path = _holiday_cache_path()
+    if not path.exists():
+        return empty
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return empty
+    if not isinstance(data, dict):
+        return empty
+    if not isinstance(data.get("years"), dict):
+        data["years"] = {}
+    return data
+
+
+def _save_holidays(data: dict[str, Any]) -> None:
+    try:
+        _holiday_cache_path().write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except Exception:
+        pass
+
+
+def _parse_apihubs_holidays(text: str) -> dict[str, Any]:
+    """apihubs 返回全年每日 workday 标记，天然带调休。"""
+    payload = json.loads(text)
+    rows = ((payload.get("data") or {}).get("list")) or []
+    rest: list[str] = []
+    work: list[str] = []
+    for row in rows:
+        try:
+            stamp = int(row.get("date"))
+            day = date(stamp // 10000, (stamp // 100) % 100, stamp % 100)
+            workday = int(row.get("workday") or 0)
+        except (TypeError, ValueError):
+            continue
+        if workday == 2 and day.weekday() <= 4:
+            rest.append(day.isoformat())
+        elif workday == 1 and day.weekday() >= 5:
+            work.append(day.isoformat())
+    if not rest and not work:
+        raise ValueError("节假日数据为空")
+    return {
+        "source": "apihubs",
+        "rest": sorted(set(rest)),
+        "work": sorted(set(work)),
+        "fetched_at": _now_text(),
+    }
+
+
+def _parse_nager_holidays(text: str) -> dict[str, Any]:
+    """nager.date 只给节日当天，没有调休；只能削掉落在工作日的节日。"""
+    payload = json.loads(text)
+    rest: list[str] = []
+    for item in payload if isinstance(payload, list) else []:
+        try:
+            day = date.fromisoformat(str(item.get("date")))
+        except (TypeError, ValueError):
+            continue
+        if day.weekday() <= 4:
+            rest.append(day.isoformat())
+    if not rest:
+        raise ValueError("节假日数据为空")
+    return {
+        "source": "nager",
+        "rest": sorted(set(rest)),
+        "work": [],
+        "fetched_at": _now_text(),
+    }
+
+
+def _fetch_holiday_calendar(year: int, source: str, fallback: str) -> Optional[dict[str, Any]]:
+    """抓取某年的放假日历；主源失败依次退备用源，全失败返回 None。"""
+    candidates = (
+        (str(source or "").replace("{year}", str(year)), _parse_apihubs_holidays),
+        (str(fallback or "").replace("{year}", str(year)), _parse_nager_holidays),
+    )
+    for url, parser in candidates:
+        if not url or "{year}" in url:
+            continue
+        if not _is_allowed_price_source_url(url):
+            continue
+        parsed: Optional[dict[str, Any]] = None
+        for attempt in range(2):
+            try:
+                parsed = parser(_price_http_get(url, timeout=15))
+            except Exception:
+                parsed = None
+            if parsed is not None:
+                break
+            # 免费接口限频较严，隔几秒再试；仍失败才换备用源
+            if attempt == 0:
+                time.sleep(3.0)
+        if parsed is None:
+            continue
+        parsed["year"] = year
+        return parsed
+    return None
+
+
+def _ensure_holiday_calendar(config: Any) -> list[int]:
+    """确保当年与次年的日历可用；返回本次真正更新过的年份。"""
+    pricing = getattr(config, "pricing", None)
+    if pricing is None or not bool(getattr(pricing, "holiday_aware", True)):
+        return []
+    today = datetime.now().date()
+    wanted = (today.year, today.year + 1)
+    source = str(getattr(pricing, "holiday_source", "") or "")
+    fallback = str(getattr(pricing, "holiday_fallback_source", "") or "")
+    data = _load_holidays()
+    years = data.setdefault("years", {})
+    refreshed: list[int] = []
+    for year in wanted:
+        cached = years.get(str(year)) if isinstance(years.get(str(year)), dict) else None
+        if cached:
+            stamp = str(cached.get("fetched_at") or "")
+            # 备用源只给节日当天、不含调休，只缓存一天，隔天重试主源
+            ttl = 1 if str(cached.get("source") or "") == "nager" else _HOLIDAY_REFRESH_DAYS
+            age = None
+            try:
+                age = (datetime.now() - datetime.strptime(stamp, "%Y-%m-%d %H:%M:%S")).days
+            except Exception:
+                age = None
+            if age is not None and 0 <= age < ttl and (cached.get("rest") or cached.get("work")):
+                continue
+        parsed = _fetch_holiday_calendar(year, source, fallback)
+        # 每年一次请求，之间留出间隔，避开免费接口的限频
+        time.sleep(_HOLIDAY_REQUEST_GAP)
+        if parsed is None:
+            continue
+        years[str(year)] = parsed
+        refreshed.append(year)
+    if refreshed:
+        _save_holidays(data)
+        _HOLIDAY_MEMO.clear()
+    return refreshed
+
+
+def _holiday_state(day: date) -> Optional[str]:
+    """返回该日的调休状态：work（补班）/ rest（放假）/ None（无数据，按星期判断）。"""
+    entry = _HOLIDAY_MEMO.get(day.year)
+    if entry is None:
+        stored = (_load_holidays().get("years") or {}).get(str(day.year))
+        if not isinstance(stored, dict):
+            return None
+        entry = {
+            "rest": set(stored.get("rest") or []),
+            "work": set(stored.get("work") or []),
+        }
+        _HOLIDAY_MEMO[day.year] = entry
+    stamp = day.isoformat()
+    if stamp in entry["work"]:
+        return "work"
+    if stamp in entry["rest"]:
+        return "rest"
+    return None
+
+
 def _select_band(bands: Any, dt_naive: datetime, tier: int) -> Optional[dict[str, Any]]:
     for band in bands or []:
         if not isinstance(band, dict):
@@ -2672,8 +2878,15 @@ def _select_band(bands: Any, dt_naive: datetime, tier: int) -> Optional[dict[str
             continue
         weekday, hour = _band_local_parts(dt_naive, str(band.get("tz") or "Asia/Shanghai"))
         days = band.get("weekdays")
-        if days and weekday not in days:
-            continue
+        if days:
+            day_set = {int(d) for d in days if isinstance(d, (int, float, str)) and str(d).lstrip("-").isdigit()}
+            # 只写周一~周五的价带就是「工作日带」：节假日跳过，调休补班日当工作日
+            workday_band = bool(day_set) and day_set <= {0, 1, 2, 3, 4}
+            state = _holiday_state(dt_naive.date()) if workday_band else None
+            if state == "rest":
+                continue
+            if state != "work" and weekday not in days:
+                continue
         hours = band.get("hours")
         if hours and not any(int(h0) <= hour < int(h1) for h0, h1 in hours):
             continue
@@ -3555,6 +3768,12 @@ async def _refresh_prices(ctx: Any, config: Any) -> dict[str, Any]:
     pricing = getattr(config, "pricing", None)
     threshold = float(getattr(pricing, "change_threshold_percent", 20.0) or 20.0)
     require_confirm = bool(getattr(pricing, "require_admin_confirm", True))
+    try:
+        refreshed_years = await asyncio.to_thread(_ensure_holiday_calendar, config)
+        if refreshed_years:
+            _log(ctx, "info", "节假日日历已更新: " + "、".join(str(y) for y in refreshed_years))
+    except Exception as exc:
+        _log(ctx, "warning", f"节假日日历更新失败，峰谷判定退回纯星期口径: {exc}")
 
     db_path = _resolve_db_path()
     if db_path is None:

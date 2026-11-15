@@ -102,3 +102,13 @@ rebuild_from = ""
 # 内置：DeepSeek=https://api-docs.deepseek.com/quick_start/pricing
 #       SiliconFlow=https://siliconflow.cn/pricing
 sources = []
+
+# ---- 法定节假日与调休（峰谷时段判定）----
+# 官方「高峰时段」只算工作日：周一至周五 9-12、14-18，且不含法定节假日；
+# 调休补班的周末反过来要按工作日算。开启后按年拉一份放假日历。
+# 取不到日历时自动退回纯星期判断，不会阻塞计费。
+holiday_aware = true
+# 主源需含 {year} 占位符，返回全年每日 workday 标记（含调休补班）
+holiday_source = "https://api.apihubs.cn/holiday/get?year={year}&size=400"
+# 备用源只含法定节日当天、不含调休，仅作兜底；兜底数据只缓存一天，隔天会重试主源
+holiday_fallback_source = "https://date.nager.at/api/v3/PublicHolidays/{year}/CN"
