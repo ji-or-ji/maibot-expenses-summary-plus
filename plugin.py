@@ -3101,19 +3101,29 @@ def _band_change(old_band: Optional[dict[str, Any]], new_band: Optional[dict[str
         return "新增", None
     if not isinstance(new_band, dict):
         return "移除", None
-    old_miss = float(old_band.get("cache_miss", 0) or 0)
-    new_miss = float(new_band.get("cache_miss", 0) or 0)
-    if old_miss != new_miss:
-        old_base, new_base = old_miss, new_miss
-    else:
-        old_base = float(old_band.get("output", 0) or 0)
-        new_base = float(new_band.get("output", 0) or 0)
-    if old_base == new_base:
-        return "持平", 0.0
-    if old_base <= 0:
+    # 三项取最大变化幅度，与计算层 _compare_price_tables 的 headline 同口径，
+    # 避免出现「标题 350%、明细 50%」这种对不上号的情况。
+    direction = "持平"
+    percent: Optional[float] = None
+    from_zero = False
+    for field in ("cache_miss", "output", "cache_hit"):
+        old_base = float(old_band.get(field, 0) or 0)
+        new_base = float(new_band.get(field, 0) or 0)
+        if old_base == new_base:
+            continue
+        if old_base <= 0:
+            if new_base > 0:
+                from_zero = True
+            continue
+        delta = (new_base - old_base) / old_base * 100.0
+        if percent is None or abs(delta) > percent:
+            percent = abs(delta)
+            direction = "增长" if delta > 0 else "下降"
+    if direction == "持平" and from_zero:
         return "增长", None
-    percent = (new_base - old_base) / old_base * 100.0
-    return ("增长" if percent > 0 else "下降"), abs(percent)
+    if direction == "持平":
+        return "持平", 0.0
+    return direction, percent
 
 
 def _price_display_alias(provider: str, model: str) -> str:
@@ -3123,6 +3133,42 @@ def _price_display_alias(provider: str, model: str) -> str:
         if text and text != model and "/" not in text:
             return text
     return model.split("/")[-1] if "/" in model else model
+
+
+_PROVIDER_LABELS = {
+    "deepseek": "DeepSeek 官方",
+    "siliconflow": "硅基流动",
+    "opencodego": "OpenCode Go",
+    "opencode": "OpenCode",
+    "moonshot": "月之暗面",
+    "openrouter": "OpenRouter",
+}
+
+
+def _provider_label(provider: str) -> str:
+    """把供应商 id 换成中文短名。同名模型（如 DeepSeek-V4-Flash）在两个供应商下价不同，卡片必须标明家。"""
+    key = str(provider or "").strip()
+    if not key:
+        return ""
+    return _PROVIDER_LABELS.get(key.lower(), key)
+
+
+def _price_entry_title(entry: dict[str, Any]) -> str:
+    """变更卡上的标题：带上供应商，避免同名模型认错家。"""
+    label = _provider_label(str(entry.get("provider") or ""))
+    name = str(entry.get("alias") or "").strip() or str(entry.get("model") or "").strip()
+    if label:
+        return "{} · {}".format(label, name) if name else label
+    return name
+
+
+def _price_entry_badge(entry: dict[str, Any]) -> str:
+    """右上角小字回显完整模型 ID。"""
+    alias = str(entry.get("alias") or "").strip()
+    model = str(entry.get("model") or "").strip()
+    if alias and model and alias != model:
+        return model
+    return ""
 
 
 def _price_change_entries(previous: dict[str, Any], current: dict[str, Any]) -> list[dict[str, Any]]:
@@ -3141,32 +3187,56 @@ def _price_change_entries(previous: dict[str, Any], current: dict[str, Any]) -> 
         tiers = merged.get("tiers") or None
         old_bands = [b for b in ((old_entry or {}).get("bands") or []) if isinstance(b, dict)]
         new_bands = [b for b in ((new_entry or {}).get("bands") or []) if isinstance(b, dict)]
+        # 按价带签名配对，与计算层的 _compare_price_tables 同口径。
+        # 早先按数组下标硬配，遇到「旧表一条兜底带、新表多出优惠带」时会把
+        # 涨价错配到优惠带上，再凭空给出一个「新增」条目——见 2026-11-15 那张 350% 卡片。
+        old_by_sig: dict[str, list[dict[str, Any]]] = {}
+        for band in old_bands:
+            old_by_sig.setdefault(_band_signature(band), []).append(band)
+        new_by_sig: dict[str, list[dict[str, Any]]] = {}
+        for band in new_bands:
+            new_by_sig.setdefault(_band_signature(band), []).append(band)
         rows: list[dict[str, Any]] = []
-        for index, new_band in enumerate(new_bands):
-            old_band = old_bands[index] if index < len(old_bands) else None
-            direction, percent = _band_change(old_band, new_band)
-            if direction == "持平":
+        for signature, bands in new_by_sig.items():
+            olds = old_by_sig.get(signature) or []
+            for index, new_band in enumerate(bands):
+                old_band = olds[index] if index < len(olds) else None
+                direction, percent = _band_change(old_band, new_band)
+                if direction == "持平":
+                    continue
+                rows.append(
+                    {
+                        "when": _describe_band_when(new_band, tiers),
+                        "direction": direction,
+                        "percent": percent,
+                        "old": _band_price_text(old_band, currency) if old_band is not None else "",
+                        "new": _band_price_text(new_band, currency),
+                    }
+                )
+            for index in range(len(bands), len(olds)):
+                old_band = olds[index]
+                rows.append(
+                    {
+                        "when": _describe_band_when(old_band, tiers),
+                        "direction": "移除",
+                        "percent": None,
+                        "old": _band_price_text(old_band, currency),
+                        "new": "",
+                    }
+                )
+        for signature, olds in old_by_sig.items():
+            if signature in new_by_sig:
                 continue
-            rows.append(
-                {
-                    "when": _describe_band_when(new_band, tiers),
-                    "direction": direction,
-                    "percent": percent,
-                    "old": _band_price_text(old_band, currency) if old_band is not None else "",
-                    "new": _band_price_text(new_band, currency),
-                }
-            )
-        for index in range(len(new_bands), len(old_bands)):
-            old_band = old_bands[index]
-            rows.append(
-                {
-                    "when": _describe_band_when(old_band, tiers),
-                    "direction": "移除",
-                    "percent": None,
-                    "old": _band_price_text(old_band, currency),
-                    "new": "",
-                }
-            )
+            for old_band in olds:
+                rows.append(
+                    {
+                        "when": _describe_band_when(old_band, tiers),
+                        "direction": "移除",
+                        "percent": None,
+                        "old": _band_price_text(old_band, currency),
+                        "new": "",
+                    }
+                )
         if not rows:
             continue
         alias = _price_display_alias(provider, model)
@@ -3193,9 +3263,17 @@ def _price_unchanged_models(previous: dict[str, Any], current: dict[str, Any]) -
         new_bands = [b for b in (new_entry.get("bands") or []) if isinstance(b, dict)]
         if not old_bands or len(old_bands) != len(new_bands):
             continue
-        if all(_band_change(old_band, new_band)[0] == "持平" for old_band, new_band in zip(old_bands, new_bands)):
-            _, model = _split_price_key(key)
-            names.append(model)
+        old_by_sig = {_band_signature(b): b for b in old_bands}
+        new_by_sig = {_band_signature(b): b for b in new_bands}
+        if set(old_by_sig) != set(new_by_sig):
+            continue
+        if all(
+            _band_change(old_by_sig[sig], new_by_sig[sig])[0] == "持平" for sig in old_by_sig
+        ):
+            provider, model = _split_price_key(key)
+            alias = _price_display_alias(provider, model)
+            label = _provider_label(provider)
+            names.append("{}·{}".format(label, alias) if label else alias)
     return names
 
 
@@ -3207,7 +3285,7 @@ def _describe_price_change(previous: dict[str, Any], current: dict[str, Any], he
         lines.append("没有可展示的明细。")
     for entry in entries:
         lines.append("")
-        lines.append("{}  {}".format(entry["model"], entry["alias"]).strip())
+        lines.append("{}".format(_price_entry_title(entry)))
         for row in entry["rows"]:
             if row["direction"] == "新增":
                 lines.append("  {}  {}：{}".format(row["when"], row["direction"], row["new"]))
@@ -3267,8 +3345,8 @@ def _build_price_change_html(previous: dict[str, Any], current: dict[str, Any], 
         rows_html.append(
             '<div class="row"><div class="row-top"><div class="model">{}</div>'
             '<div class="badge">{}</div></div>{}</div>'.format(
-                html.escape(entry["model"]),
-                html.escape(entry["alias"]),
+                html.escape(_price_entry_title(entry)),
+                html.escape(_price_entry_badge(entry)),
                 "".join(_price_change_band_html(row) for row in entry["rows"]),
             )
         )
